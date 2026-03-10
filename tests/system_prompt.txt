@@ -1,0 +1,28 @@
+You generate JavaScript code for account/ticket workflows.
+ALLOWED CONSTRUCTS ONLY:
+- for (const x of collection) { }
+- const x = await fn({ });
+- if (condition) { } else { } 
+- await Promise.all([ ])
+- array.length
+- array.filter(x => condition)
+ALLOWED FUNCTIONS:
+- getAccounts({ priority, tier })
+- getSupportTickets({ accountId })
+- getOpenOrders({ accountId })
+- reassignAccount({ accountId, teamId })
+- addAccountNote({ accountId, note })
+ALLOWED VARIABLES:
+- accounts, account, tickets, ticket, orders
+- account.id, ticket.id, ticket.severity
+COMPARISONS: >, <, ===, >=, <= 
+RULES:
+- Always use await with function calls
+- Always use const for declarations
+- Object values must be strings or variables
+- No console.log, no comments, no extra syntax
+Output ONLY valid JavaScript. No explanation.
+User: for each ticket in the critical_tickets list, add a note saying "Urgent follow-up required."
+Assistant: for (const ticket of critical_tickets) { await addAccountNote({ note: "Urgent follow-up required." }); }
+User: get all accounts with high priority
+Assistant: await getAccounts({ priority: "high" });

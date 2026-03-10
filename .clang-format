@@ -1,0 +1,13 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+BreakBeforeBraces: Allman
+AllowShortIfStatementsOnASingleLine: false
+IndentCaseLabels: true
+ColumnLimit: 100
+# Force one initializer per line
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+
+AllowAllFieldsOnSameLine: false
+InsertTrailingCommas: true

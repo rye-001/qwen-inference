@@ -1,0 +1,78 @@
+# tests/CMakeLists.txt
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  URL https://github.com/google/googletest/archive/03597a01ee50ed33e9dfd640b249b4be3799d395.zip
+)
+FetchContent_MakeAvailable(googletest)
+
+# Define the unit test executable
+add_executable(qwen3-unit-tests
+    unit/test_tokenizer.cpp
+    unit/test_vocab_file_loading.cpp
+)
+
+# Link libraries for unit tests
+target_link_libraries(qwen3-unit-tests PRIVATE
+    GTest::gtest_main
+    qwen3-core
+    ggml
+)
+
+# Discover and add unit tests to CTest
+include(GoogleTest)
+gtest_discover_tests(qwen3-unit-tests)
+
+# Define the integration test executable
+add_executable(qwen3-integration-tests
+    integration/test_e2e_generation.cpp
+)
+
+# Link libraries for integration tests
+target_link_libraries(qwen3-integration-tests PRIVATE
+    GTest::gtest_main
+    qwen3-core
+    ggml
+)
+
+# Discover and add integration tests to CTest
+gtest_discover_tests(qwen3-integration-tests)
+
+# Define the standalone order management test (Non-GTest)
+add_executable(qwen3-order-mngmt-test
+    integration/test_order_management_generation.cpp
+)
+
+# Link libraries
+target_link_libraries(qwen3-order-mngmt-test PRIVATE
+    qwen3-core
+    ggml
+)
+
+# Define the standalone order management test (Non-GTest)
+add_executable(qwen3-parallel-order-mngmt-test
+    integration/test_parallel_order_management.cpp
+)
+
+# Link libraries
+target_link_libraries(qwen3-parallel-order-mngmt-test PRIVATE
+    qwen3-core
+    ggml
+)
+
+# HTTP Server Integration Test (GTest)
+add_executable(qwen3-http-server-test
+    integration/test_http_server.cpp
+)
+
+target_link_libraries(qwen3-http-server-test PRIVATE
+    inference_server
+    httplib::httplib
+    nlohmann_json::nlohmann_json
+    GTest::gtest
+    GTest::gtest_main
+    Threads::Threads
+)
+
+target_compile_features(qwen3-http-server-test PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-http-server-test)

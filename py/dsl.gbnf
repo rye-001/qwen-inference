@@ -1,0 +1,64 @@
+root ::= expression
+
+expression ::= form | variable | string
+
+form ::= "[" ws? ( let_form | if_form | foreach_form | parallel_form | filter_form | compare_form | builtin_call | function_call ) ws? "]"
+
+# Special forms (fixed arity)
+let_form      ::= let ws? "," ws? identifier ws? "," ws? expression
+if_form       ::= if ws? "," ws? expression ws? "," ws? expression ws? "," ws? expression
+foreach_form  ::= forEach ws? "," ws? identifier ws? "," ws? identifier ws? "," ws? expression
+parallel_form ::= parallel ws? "," ws? "[" ws? expression (ws? "," ws? expression)* ws? "]"
+filter_form   ::= filter ws? "," ws? variable ws? "," ws? identifier ws? "," ws? expression
+
+# Operators
+compare_form  ::= comparator ws? "," ws? expression ws? "," ws? expression
+comparator    ::= ">" | "<" | "==" | ">=" | "<="
+
+# Builtins (expression arguments)
+builtin_call  ::= builtin (ws? "," ws? expression)+
+builtin       ::= count | concat
+
+# Domain functions (object argument)
+function_call ::= function ws? "," ws? object
+function      ::= getAccounts | getSupportTickets | getOpenOrders | reassignAccount | addAccountNote
+
+# Object literals
+object    ::= "{" ws? (param (ws? "," ws? param)*)? ws? "}"
+param     ::= param_key ws? ":" ws? value
+param_key ::= accountId | teamId | priority | tier | note | severity
+value     ::= expression
+
+# Terminals - Keywords (unquoted)
+let      ::= "let"
+if       ::= "if"
+forEach  ::= "forEach"
+parallel ::= "parallel"
+filter   ::= "filter"
+count    ::= "count"
+concat   ::= "concat"
+
+getAccounts       ::= "getAccounts"
+getSupportTickets ::= "getSupportTickets"
+getOpenOrders     ::= "getOpenOrders"
+reassignAccount   ::= "reassignAccount"
+addAccountNote    ::= "addAccountNote"
+
+accountId ::= "accountId"
+teamId    ::= "teamId"
+priority  ::= "priority"
+tier      ::= "tier"
+note      ::= "note"
+severity  ::= "severity"
+
+# Variables (unquoted, fixed vocabulary)
+variable   ::= "$" var_path
+var_path   ::= "account.id" | "ticket.id" | "ticket.severity" | "tickets" | "orders" | "critical_tickets" | "account" | "ticket"
+
+identifier ::= "accounts" | "account" | "ticket" | "tickets" | "orders" | "critical_tickets"
+
+# User input (quoted) - the ONLY place for dynamic content
+# Note: Escape sequences not supported (requires . any-char construct)
+string ::= "\"" [^"\\]* "\""
+
+ws ::= [ \t\n\r]+

@@ -1,0 +1,80 @@
+# JavaScript Subset Grammar - Token-Aligned Version
+# 
+# This grammar is designed to work with token-level constrained generation.
+# Key design decisions:
+# 1. No character classes - they don't work correctly with token boundaries
+# 2. Whitespace handled as explicit " " literals with optional markers
+# 3. String content uses predefined literals instead of [^"]*
+#
+# DSL: [forEach, accounts, account, [getSupportTickets, {accountId: $account.id}]]
+# JS:  for (const account of accounts) { await getSupportTickets({ accountId: account.id }); }
+
+root ::= statement
+
+statement ::= for_of | let_decl | if_else | parallel_block | await_call
+
+# forEach -> for...of
+# DSL: [forEach, collection, item, body]
+# JS:  for (const item of collection) { body }
+for_of ::= "for" " " "(" "const" " " identifier " " "of" " " identifier ")" " "? block
+
+# let -> const assignment
+# DSL: [let, varname, expression]
+# JS:  const varname = expression;
+let_decl ::= "const" " " identifier " "? "=" " "? expression " "? ";"
+
+# if -> if/else
+# DSL: [if, condition, then_expr, else_expr]
+# JS:  if (condition) { then } else { else }
+if_else ::= "if" " "? "(" " "? condition " "? ")" " "? block " "? "else" " "? block
+
+# parallel -> Promise.all
+# DSL: [parallel, [expr1, expr2, ...]]
+# JS:  await Promise.all([ expr1, expr2, ... ]);
+parallel_block ::= "await" " " "Promise.all" " "? "(" " "? "[" " "? await_call_list " "? "]" " "? ")" " "? ";"
+
+# function_call -> await func(obj)
+# DSL: [getAccounts, {priority: "high"}]
+# JS:  await getAccounts({ priority: "high" });
+await_call ::= "await" " " function_call " "? ";"
+
+await_call_list ::= await_call_item (" "? "," " "? await_call_item)*
+await_call_item ::= "await" " " function_call
+
+# Block: { statements }
+block ::= "{" " "? statement* " "? "}"
+
+# Expressions
+expression ::= await_expr | count_expr | variable | string
+
+# await expression (for assignment)
+await_expr ::= "await" " " function_call
+
+# count -> array.length
+# DSL: [count, $array]
+# JS:  array.length
+count_expr ::= identifier "." "length"
+
+# Conditions
+condition ::= expression " "? comparator " "? expression
+comparator ::= ">" | "<" | "===" | ">=" | "<="
+
+# Function calls
+function_call ::= function_name " "? "(" " "? object? " "? ")"
+function_name ::= "getAccounts" | "getSupportTickets" | "getOpenOrders" | "reassignAccount" | "addAccountNote"
+
+# Object literals
+# DSL: {accountId: $account.id, priority: "high"}
+# JS:  { accountId: account.id, priority: "high" }
+object ::= "{" " "? (param (" "? "," " "? param)*)? " "? "}"
+param ::= param_key " "? ":" " "? param_value
+param_key ::= "accountId" | "teamId" | "priority" | "tier" | "note" | "severity"
+param_value ::= expression
+
+# Variables
+# DSL: $account.id
+# JS:  account.id
+variable ::= identifier ("." identifier)*
+identifier ::= "accounts" | "account" | "ticket" | "tickets" | "orders" | "critical_tickets" | "id" | "severity" | "length"
+
+string ::= "\"" [^"]* "\""
