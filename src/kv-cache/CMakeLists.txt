@@ -1,6 +1,7 @@
 # KV Cache Management Library
 add_library(qwen3-kv-cache STATIC
     simple-kv-cache.cpp
+    ssm-state-cache.cpp
 )
 
 target_include_directories(qwen3-kv-cache PUBLIC

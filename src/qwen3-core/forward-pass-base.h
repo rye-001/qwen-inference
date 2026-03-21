@@ -1,0 +1,101 @@
+#pragma once
+
+#include <vector>
+#include <cstdint>
+#include <memory>
+
+#include "qwen3-model.h"
+#include "../kv-cache/simple-kv-cache.h"
+
+struct ggml_context;
+struct ggml_tensor;
+struct ggml_cgraph;
+
+constexpr size_t FP_GRAPH_SIZE_METADATA = 128 * 1024 * 1024;
+constexpr size_t FP_GRAPH_SIZE = 16384;
+
+/**
+ * Base class for forward pass implementations.
+ * 
+ * Owns the shared ggml context and buffer. Provides utility methods
+ * used by all architectures: embedding lookup, RMS norm, SwiGLU FFN,
+ * multi-head attention kernel, output logits extraction.
+ *
+ * Each architecture subclass owns its own cache(s) and implements
+ * its own graph building logic.
+ */
+class ForwardPassBase {
+public:
+    ForwardPassBase(const Qwen3Model& model, const Qwen3Metadata* metadata);
+    virtual ~ForwardPassBase();
+
+    virtual ggml_cgraph* build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx = 0) = 0;
+    virtual void set_inputs(ggml_cgraph* gf, const std::vector<int32_t>& tokens, int pos) = 0;
+    virtual void advance_cache(uint32_t n_tokens, uint32_t slot_idx) = 0;
+    virtual void clear_slot(uint32_t slot_idx) = 0;
+    virtual void set_cache_pos(uint32_t pos, uint32_t slot_idx) = 0;
+    virtual uint32_t get_cache_pos(uint32_t slot_idx) const = 0;
+    virtual void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) = 0;
+    virtual ggml_cgraph* build_decoding_graph(
+        const std::vector<int32_t>& tokens,
+        const std::vector<uint32_t>& slots,
+        const std::vector<int32_t>& positions) = 0;
+
+    virtual void set_batched_inputs(ggml_cgraph* gf,
+        const std::vector<int32_t>& tokens,
+        const std::vector<uint32_t>& slots,
+        const std::vector<int32_t>& positions) = 0;
+    
+    // --- Output extraction (shared by all architectures) ---
+    std::vector<float> get_output_logits(ggml_cgraph* gf);
+    std::vector<float> get_output_logits_for_slot(ggml_cgraph* gf, uint32_t slot_index);
+
+protected:
+    const Qwen3Metadata& meta_;
+    const Qwen3Model& model_;
+    struct ggml_context* ctx_;
+    std::vector<uint8_t> ctx_buffer_;
+
+    // --- Context management ---
+    // Reset the ggml context (call at the start of every graph build)
+    void reset_context();
+
+    // Create a new graph
+    ggml_cgraph* new_graph();
+
+    // --- Shared graph-building primitives ---
+
+    ggml_tensor* embedding(ggml_cgraph* gf, const std::vector<int32_t>& tokens);
+
+    ggml_tensor* build_norm(
+        ggml_cgraph* gf,
+        ggml_tensor* cur,
+        ggml_tensor* mw,
+        int il) const;
+
+    ggml_tensor* ffn_swiglu(
+        ggml_cgraph* gf,
+        ggml_tensor* cur,
+        ggml_tensor* gate,
+        ggml_tensor* up,
+        ggml_tensor* down,
+        int il);
+
+    // Core multi-head attention: Q @ K^T → softmax → @ V
+    // Handles GQA, permutations, stream splitting, and recombination.
+    ggml_tensor* build_attn_mha(
+        ggml_cgraph* gf,
+        ggml_tensor* q,
+        ggml_tensor* k,
+        ggml_tensor* v,
+        ggml_tensor* kq_mask,
+        ggml_tensor* sinks,
+        float kq_scale,
+        uint32_t pos,
+        int il) const;
+
+    // Build the output head: final norm → LM head matmul → "logits" tensor
+    void build_output_head(ggml_cgraph* gf, ggml_tensor* cur);
+
+    void set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il = -1) const;
+};

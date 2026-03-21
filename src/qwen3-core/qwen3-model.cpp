@@ -216,34 +216,70 @@ void Qwen3Model::assign_tensor_pointers(const std::unordered_map<std::string, gg
         token_embd_weight_ = tensors.at("token_embd.weight");
         output_norm_weight_ = tensors.at("output_norm.weight");
 
-        // Qwen2 has a dedicated output weight matrix
+        // Output weight: qwen2 has dedicated output.weight, qwen3/qwen35 use weight tying
         if (metadata_.architecture == "qwen2") {
             auto it = tensors.find("output.weight");
             if (it != tensors.end()) {
                 output_weight_ = it->second;
             }
         }
+        // qwen35 and qwen3: output_weight_ stays nullptr (weight tying)
 
         blocks_.resize(metadata_.block_count);
         for (uint32_t i = 0; i < metadata_.block_count; ++i) {
             std::string prefix = "blk." + std::to_string(i) + ".";
+
+            // Shared: attention norm (pre-attention RMS norm)
             blocks_[i].attn_norm_weight = tensors.at(prefix + "attn_norm.weight");
-            blocks_[i].attn_q_weight = tensors.at(prefix + "attn_q.weight");
-            blocks_[i].attn_k_weight = tensors.at(prefix + "attn_k.weight");
-            blocks_[i].attn_v_weight = tensors.at(prefix + "attn_v.weight");
-            blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
-            blocks_[i].ffn_norm_weight = tensors.at(prefix + "ffn_norm.weight");
+
+            // FFN (shared by all layer types in all architectures)
             blocks_[i].ffn_gate_weight = tensors.at(prefix + "ffn_gate.weight");
-            blocks_[i].ffn_up_weight = tensors.at(prefix + "ffn_up.weight");
+            blocks_[i].ffn_up_weight   = tensors.at(prefix + "ffn_up.weight");
             blocks_[i].ffn_down_weight = tensors.at(prefix + "ffn_down.weight");
 
-            if (metadata_.architecture == "qwen3") {
+            if (metadata_.architecture == "qwen35") {
+                // qwen35: FFN norm is called "post_attention_norm"
+                blocks_[i].ffn_norm_weight = tensors.at(prefix + "post_attention_norm.weight");
+
+                if (metadata_.is_full_attention_layer(i)) {
+                    // Full softmax attention layer (layers 3,7,11,15,19,23)
+                    blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
+                    blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
+                    blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
+                    blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
+                    blocks_[i].attn_q_norm_weight = tensors.at(prefix + "attn_q_norm.weight");
+                    blocks_[i].attn_k_norm_weight = tensors.at(prefix + "attn_k_norm.weight");
+                } else {
+                    // SSM (GatedDeltaNet) layer
+                    blocks_[i].ssm_a              = tensors.at(prefix + "ssm_a");
+                    blocks_[i].ssm_conv1d_weight  = tensors.at(prefix + "ssm_conv1d.weight");
+                    blocks_[i].ssm_dt_bias        = tensors.at(prefix + "ssm_dt.bias");
+                    blocks_[i].ssm_alpha_weight   = tensors.at(prefix + "ssm_alpha.weight");
+                    blocks_[i].ssm_beta_weight    = tensors.at(prefix + "ssm_beta.weight");
+                    blocks_[i].attn_qkv_weight    = tensors.at(prefix + "attn_qkv.weight");
+                    blocks_[i].attn_gate_weight   = tensors.at(prefix + "attn_gate.weight");
+                    blocks_[i].ssm_norm_weight    = tensors.at(prefix + "ssm_norm.weight");
+                    blocks_[i].ssm_out_weight     = tensors.at(prefix + "ssm_out.weight");
+                }
+
+            } else if (metadata_.architecture == "qwen3") {
+                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
                 blocks_[i].attn_q_norm_weight = tensors.at(prefix + "attn_q_norm.weight");
                 blocks_[i].attn_k_norm_weight = tensors.at(prefix + "attn_k_norm.weight");
+
             } else if (metadata_.architecture == "qwen2") {
-                blocks_[i].attn_q_bias = tensors.at(prefix + "attn_q.bias");
-                blocks_[i].attn_k_bias = tensors.at(prefix + "attn_k.bias");
-                blocks_[i].attn_v_bias = tensors.at(prefix + "attn_v.bias");
+                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
+                blocks_[i].attn_q_bias        = tensors.at(prefix + "attn_q.bias");
+                blocks_[i].attn_k_bias        = tensors.at(prefix + "attn_k.bias");
+                blocks_[i].attn_v_bias        = tensors.at(prefix + "attn_v.bias");
             }
         }
     }
@@ -257,7 +293,7 @@ bool Qwen3Model::validate_architecture() const
     if (!is_loaded_) {
         return false;
     }
-    return metadata_.architecture == "qwen3" || metadata_.architecture == "qwen2";
+    return metadata_.architecture == "qwen3" || metadata_.architecture == "qwen2" || metadata_.architecture == "qwen35";
 }
 
 Qwen3ModelSize Qwen3Model::detect_model_size() const

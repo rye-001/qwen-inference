@@ -2,7 +2,10 @@
 add_library(qwen3-core STATIC
     qwen3-model.cpp
     gguf-loader.cpp
+    forward-pass-base.cpp
     forward-pass.cpp
+    forward-pass-qwen35.cpp
+    forward-pass-factory.cpp
     tokenizer.cpp
     sampling.cpp
     grammar.cpp

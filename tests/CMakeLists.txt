@@ -10,6 +10,13 @@ FetchContent_MakeAvailable(googletest)
 add_executable(qwen3-unit-tests
     unit/test_tokenizer.cpp
     unit/test_vocab_file_loading.cpp
+    unit/test_qwen35_metadata.cpp
+    unit/test_qwen35_tensor_loading.cpp
+    unit/test_ssm_state_cache.cpp
+    unit/test_qwen35_tokenizer.cpp
+    unit/test_qwen35_hybrid_cache.cpp
+    unit/test_qwen35_forward_attn.cpp
+    unit/test_qwen35_generation.cpp
 )
 
 # Link libraries for unit tests

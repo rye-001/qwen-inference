@@ -6,65 +6,42 @@
 #include <cmath>
 #include <cinttypes>
 
-constexpr int GGML_ROPE_MODE_NORMAL = 0;
-
-constexpr size_t GRAPH_SIZE_METADATA = 128 * 1024 * 1024; // 64MB for graph nodes
 constexpr size_t GRAPH_SIZE = 16384;
 
-Qwen3ForwardPass::Qwen3ForwardPass(const Qwen3Model& model, const Qwen3Metadata* metadata, uint32_t context_len, uint32_t max_batch_size)
-    : meta_(*metadata), model_(model) {
+Qwen3ForwardPass::Qwen3ForwardPass(
+    const Qwen3Model& model, const Qwen3Metadata* metadata, 
+    uint32_t context_len, uint32_t max_batch_size)
+    : ForwardPassBase(model, metadata) {
         kv_cache_ = nullptr;
+        ggml_backend_t cache_backend = model_.has_metal_backend()
+            ? model_.get_backend_metal()
+            : model_.get_backend_cpu();
 
-        uint32_t n_embd_k, n_embd_v;
-        if (meta_.architecture == "qwen2") {
-            n_embd_k = meta_.embedding_length / meta_.attention_head_count * meta_.attention_head_count_kv;
-            n_embd_v = meta_.embedding_length / meta_.attention_head_count * meta_.attention_head_count_kv;
-        } else { // qwen3
-            n_embd_k = meta_.attention_key_length * meta_.attention_head_count_kv;
-            n_embd_v = meta_.attention_value_length * meta_.attention_head_count_kv;
+            // === Qwen2/Qwen3 standard cache ===
+            uint32_t n_embd_k, n_embd_v;
+            if (meta_.architecture == "qwen2") {
+                n_embd_k = meta_.embedding_length / meta_.attention_head_count * meta_.attention_head_count_kv;
+                n_embd_v = meta_.embedding_length / meta_.attention_head_count * meta_.attention_head_count_kv;
+            } else { // qwen3
+                n_embd_k = meta_.attention_key_length * meta_.attention_head_count_kv;
+                n_embd_v = meta_.attention_value_length * meta_.attention_head_count_kv;
+            }
+
+            kv_cache_ = std::make_unique<simple_kv_cache>(
+                meta_.block_count,
+                context_len,
+                max_batch_size,
+                n_embd_k,
+                n_embd_v,
+                GGML_TYPE_F32,
+                GGML_TYPE_F32,
+                cache_backend
+            );
         }
 
-        kv_cache_ = std::make_unique<simple_kv_cache>(
-            meta_.block_count,
-            context_len,
-            max_batch_size,
-            n_embd_k,
-            n_embd_v,
-            GGML_TYPE_F32,
-            GGML_TYPE_F32,
-            model_.has_metal_backend() ? model_.get_backend_metal() : model_.get_backend_cpu()
-        );
-
-        // Pre-allocate persistent buffer for graph metadata
-        ctx_buffer_.resize(GRAPH_SIZE_METADATA);
-
-        struct ggml_init_params params = {
-            .mem_size   = ctx_buffer_.size(),
-            .mem_buffer = ctx_buffer_.data(),
-            .no_alloc   = true,
-        };
-        ctx_ = ggml_init(params);
-    }
-
-Qwen3ForwardPass::~Qwen3ForwardPass() {
-    if (ctx_) {
-        ggml_free(ctx_);
-    }
-}
-
 struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx) {
-    // Reset context using persistent buffer (Zero Allocation)
-    if (ctx_) {
-        ggml_free(ctx_);
-    }
-    struct ggml_init_params params = {
-        .mem_size   = ctx_buffer_.size(),
-        .mem_buffer = ctx_buffer_.data(),
-        .no_alloc   = true, 
-    };
-    ctx_ = ggml_init(params);
-
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx_, GRAPH_SIZE, false);
+    reset_context();
+    ggml_cgraph* gf = new_graph();
     int n_layers = meta_.block_count;        // Layers 0-27
     int hidden_dim = meta_.embedding_length;    // Model dimension
     int n_head = meta_.attention_head_count;       // Query heads
@@ -200,7 +177,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
         set_tensor_name(gf, cur, "ffn_norm", il);
 
         // G. Feed-Forward Network (SwiGLU)
-        cur = _ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
+        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
         set_tensor_name(gf, cur, "ffn_output", il);
 
         // H. Residual connection after FFN
@@ -211,20 +188,8 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
         inpL = cur;
     }
 
-    cur = inpL;
-
     // 3. Final normalization and output projection
-    cur = build_norm(gf, cur, model_.get_output_norm_weight(), -1);
-    set_tensor_name(gf, cur, "final_norm");
-    
-    // Output projection (matmul with token_embd.weight or dedicated output matrix)
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
-    }
-    ggml_set_name(cur, "logits"); // Name output for retrieval
-    ggml_build_forward_expand(gf, cur);
+    build_output_head(gf, inpL);
 
     return gf;
 }
@@ -341,7 +306,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 
         // F. FFN
         cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-        cur = _ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
+        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
         
         // H. FFN Residual
         cur = ggml_add(ctx_, cur, ffn_inp);
@@ -361,26 +326,6 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 
     return gf;
 }
-
-ggml_tensor* Qwen3ForwardPass::_ffn_swiglu(
-    ggml_cgraph* gf,
-    ggml_tensor* cur,
-    ggml_tensor* gate,
-    ggml_tensor* up,
-    ggml_tensor* down,
-    int il
-) {
-
-    ggml_tensor * tmp = ggml_mul_mat(ctx_, up, cur);
-    set_tensor_name(gf, tmp, "ffn_up", il);
-    cur = ggml_mul_mat(ctx_, gate, cur);
-    set_tensor_name(gf, cur, "ffn_gate", il);
-    cur = ggml_swiglu_split(ctx_, cur, tmp);
-    set_tensor_name(gf, cur, "ffn_swiglu", il);
-    cur = ggml_mul_mat(ctx_, down, cur);
-    return cur;
-}
-
 
 ggml_tensor * Qwen3ForwardPass::_build_batched_attention_layer(
     ggml_cgraph * gf,
@@ -471,7 +416,7 @@ ggml_tensor * Qwen3ForwardPass::_build_batched_attention_layer(
         0);
         
     // 4. Compute Attention
-    return _build_attn_mha(gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
+    return build_attn_mha(gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
 }
 
 ggml_tensor * Qwen3ForwardPass::_build_attention_layer(
@@ -547,112 +492,10 @@ ggml_tensor * Qwen3ForwardPass::_build_attention_layer(
     ggml_build_forward_expand(gf, kq_mask);
 
     // 5. Execute attention with the cached values
-    ggml_tensor * cur = _build_attn_mha(gf, q, k, v, kq_mask, nullptr, kq_scale, pos, il);
+    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_mask, nullptr, kq_scale, pos, il);
     return cur;
 }
 
-
-ggml_tensor * Qwen3ForwardPass::_build_attn_mha(
-         ggml_cgraph * gf,
-         ggml_tensor * q,
-         ggml_tensor * k,
-         ggml_tensor * v,
-         ggml_tensor * kq_mask,
-         ggml_tensor * sinks,
-         float kq_scale,
-         uint32_t pos,
-        int il) const {
-    const bool v_trans = v->nb[1] > v->nb[2];
-
-    // split the batch into streams if needed
-    const auto n_stream = k->ne[3];
-
-    q = ggml_reshape_4d(ctx_, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream);
-    set_tensor_name(gf, q, "q_reshaped", il);
-
-    q = ggml_permute(ctx_, q, 0, 2, 1, 3);
-    set_tensor_name(gf, q, "q_permuted", il);
-    k = ggml_permute(ctx_, k, 0, 2, 1, 3);
-    set_tensor_name(gf, k, "k_permuted", il);
-    v = ggml_permute(ctx_, v, 1, 2, 0, 3);
-    set_tensor_name(gf, v, "v_permuted", il);
-    v = ggml_cont(ctx_, v);
-    set_tensor_name(gf, v, "v_cont", il);
-
-    const auto n_kv = k->ne[1];
-
-    ggml_tensor * cur;
-
-    {
-        ggml_tensor * kq = ggml_mul_mat(ctx_, k, q);
-        set_tensor_name(gf, kq, "kq", il);
-
-        // note: this op tends to require high floating point range
-        //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-
-        kq = ggml_soft_max_ext(ctx_, kq, kq_mask, kq_scale, 0/*hparams.f_max_alibi_bias*/);
-        set_tensor_name(gf, kq, "kq_soft", il);
-
-        ggml_soft_max_add_sinks(kq, sinks);
-
-        ggml_tensor * kqv = ggml_mul_mat(ctx_, v, kq);
-        set_tensor_name(gf, kqv, "kqv", il);
-
-        cur = ggml_permute(ctx_, kqv, 0, 2, 1, 3);
-        set_tensor_name(gf, cur, "kqv_permuted", il);
-
-        // recombine streams
-        cur = ggml_cont_2d(ctx_, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
-        set_tensor_name(gf, cur, "attn_recombined", il);    
-    }
-
-    return cur;
-}
-
-// Get output logits for a specific batch slot
-std::vector<float> Qwen3ForwardPass::get_output_logits_for_slot(ggml_cgraph* gf, uint32_t slot_index) {
-    ggml_tensor* logits_gpu = ggml_graph_get_tensor(gf, "logits");
-    if (!logits_gpu) {
-        throw std::runtime_error("logits tensor not found in graph");
-    }
-    
-    // logits shape: [vocab_size, batch_size]
-    uint32_t vocab_size = logits_gpu->ne[0];
-    uint32_t batch_size = logits_gpu->ne[1];
-    
-    if (slot_index >= batch_size) {
-        throw std::out_of_range("slot_index out of bounds for logits tensor");
-    }
-    
-    size_t offset_bytes = slot_index * vocab_size * sizeof(float);
-    std::vector<float> logits(vocab_size);
-    
-    ggml_backend_tensor_get(logits_gpu, logits.data(), offset_bytes, vocab_size * sizeof(float));
-    
-    return logits;
-}
-
-void Qwen3ForwardPass::set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il) const {
-    if (il != -1) {
-        char new_name[128];
-        snprintf(new_name, sizeof(new_name), "%s.%d", name, il);
-        ggml_set_name(tensor, new_name);
-    } else {
-        ggml_set_name(tensor, name);
-    }
-}
-
-ggml_tensor * Qwen3ForwardPass::build_norm(
-        ggml_cgraph * gf,
-        ggml_tensor * cur,
-        ggml_tensor * mw,
-        int   il) const {
-    cur = ggml_rms_norm(ctx_, cur, meta_.rms_norm_eps);
-    set_tensor_name(gf, cur, "cur_rms_normed", il);
-    cur = ggml_mul(ctx_, cur, mw);
-    return cur;
-}
 
 // Set input data AFTER allocation
 void Qwen3ForwardPass::set_inputs(ggml_cgraph* gf, 
@@ -784,46 +627,4 @@ for (uint32_t b = 0; b < n_tokens; ++b) {
         ggml_backend_tensor_set(gather_indices, indices.data(), 0, indices.size() * sizeof(int32_t));
     }
 }
-
-// Get output from GPU
-std::vector<float> Qwen3ForwardPass::get_output_logits(ggml_cgraph* gf) {
-    ggml_tensor* logits_gpu = ggml_graph_get_tensor(gf, "logits");
-    if (!logits_gpu) {
-        throw std::runtime_error("logits tensor not found in graph");
-    }
-    
-    size_t logits_size = ggml_nbytes(logits_gpu);
-    std::vector<float> logits_cpu(logits_size / sizeof(float));
-    ggml_backend_tensor_get(logits_gpu, logits_cpu.data(), 0, logits_size);
-    
-    return logits_cpu;
-}
-
-
-ggml_tensor* Qwen3ForwardPass::embedding(ggml_cgraph* gf, const std::vector<int32_t>& tokens) {
-    const size_t n_tokens = tokens.size();
-
-    // 1. Create a 1D tensor from the input token IDs
-    struct ggml_tensor* tokens_tensor = ggml_new_tensor_1d(
-        ctx_,
-        GGML_TYPE_I32,
-        n_tokens
-    );
-    
-    ggml_set_input(tokens_tensor);
-    set_tensor_name(gf, tokens_tensor, "tokens");
-    ggml_build_forward_expand(gf, tokens_tensor);
-    // memcpy(tokens_tensor->data, tokens.data(), ggml_nbytes(tokens_tensor));
-
-    // 2. Perform the embedding lookup using ggml_get_rows
-    ggml_tensor * cur = ggml_get_rows(
-        ctx_,
-        model_.get_token_embedding_weight(),
-        tokens_tensor
-    );
-
-    ggml_set_name(cur, "embed_lookup");
-    return cur;
-}
-
 
