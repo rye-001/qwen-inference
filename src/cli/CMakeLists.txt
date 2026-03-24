@@ -1,5 +1,7 @@
 # Qwen-3 CLI Executable
 add_executable(qwen3-cli
+    complete.cpp
+    chat.cpp
     main.cpp
 )
 

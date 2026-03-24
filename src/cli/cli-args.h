@@ -1,0 +1,47 @@
+#pragma once
+
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <sstream>
+
+struct CliArgs {
+    std::string model_path;
+    std::string prompt;
+    int max_tokens = 100;
+    float temperature = 0.7f;
+    float repetition_penalty = 1.1f;
+    int top_k = 40;
+    float top_p = 0.95f;
+    bool verbose = false;
+    bool help = false;
+    bool run_test = false;
+    bool chat_mode = false;
+    std::string vocab_prune_list_path;
+    uint32_t context_length = 4096;
+    std::string token_log_path;
+    std::string grammar_file;
+    std::string system_prompt;
+    // PLD options
+    bool speculative = false;
+    int pld_ngram_size = 3;
+    int pld_max_draft = 5;
+};
+
+struct ChatMessage {
+    std::string role;
+    std::string content;
+};
+
+// Format chat history into Qwen ChatML template
+inline std::string apply_chat_template(const std::vector<ChatMessage>& history, bool add_assistant_prompt = true) {
+    std::ostringstream prompt_stream;
+    for (const auto& message : history) {
+        prompt_stream << "<|im_start|>" << message.role << "\n"
+                      << message.content << "<|im_end|>\n";
+    }
+    if (add_assistant_prompt) {
+        prompt_stream << "<|im_start|>assistant\n";
+    }
+    return prompt_stream.str();
+}
