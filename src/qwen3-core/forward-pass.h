@@ -50,11 +50,13 @@ public:
     void clear_slot(uint32_t slot_idx) override {
         if (tq_store_) tq_store_->clear_slot(slot_idx);  // resets position + compressed data
         if (kv_cache_) kv_cache_->clear_slot(slot_idx);
+        _tq_invalidate_watermarks(slot_idx);
     }
 
     void set_cache_pos(uint32_t pos, uint32_t slot_idx) override {
         if (tq_store_) tq_store_->set_pos(slot_idx, pos);
         else if (kv_cache_) kv_cache_->set_pos(pos, slot_idx);
+        _tq_invalidate_watermarks(slot_idx);
     }
 
     uint32_t get_cache_pos(uint32_t slot_idx) const override {
@@ -65,6 +67,7 @@ public:
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) override {
         if (tq_store_) tq_store_->clone_slot(src_slot, dst_slot, n_tokens);  // copies pos too
         if (kv_cache_) kv_cache_->clone_slot(src_slot, dst_slot, n_tokens);
+        _tq_invalidate_watermarks(dst_slot);  // scratch for dst is stale
     }
 
     simple_kv_cache* get_kv_cache_ptr() { return kv_cache_.get(); }
@@ -121,6 +124,16 @@ private:
 
     // Scratch buffer for inter-layer data transfer
     std::vector<float> tq_layer_scratch_;
+
+    // Per-layer watermark: tq_scratch_valid_pos_[layer][slot] = number of tokens
+    // already decompressed into the persistent scratch for this (layer, slot).
+    // Enables incremental (delta) decompression: only [watermark..pos) is uploaded.
+    std::vector<std::vector<uint32_t>> tq_scratch_valid_pos_;
+
+    void _tq_invalidate_watermarks(uint32_t slot_idx) {
+        for (auto& per_slot : tq_scratch_valid_pos_)
+            if (slot_idx < per_slot.size()) per_slot[slot_idx] = 0;
+    }
 
     ggml_tensor* _build_batched_attention_layer(
         ggml_cgraph* gf,

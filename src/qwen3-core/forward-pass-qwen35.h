@@ -46,11 +46,13 @@ public:
         if (tq_store_) tq_store_->clear_slot(slot_idx);  // resets position + data
         if (kv_cache_) kv_cache_->clear_slot(slot_idx);
         if (ssm_cache_) ssm_cache_->clear_slot(slot_idx);
+        _tq_invalidate_watermarks(slot_idx);
     }
 
     void set_cache_pos(uint32_t pos, uint32_t slot_idx) override {
         if (tq_store_) tq_store_->set_pos(slot_idx, pos);
         else if (kv_cache_) kv_cache_->set_pos(pos, slot_idx);
+        _tq_invalidate_watermarks(slot_idx);
     }
 
     uint32_t get_cache_pos(uint32_t slot_idx) const override {
@@ -62,6 +64,7 @@ public:
         if (tq_store_) tq_store_->clone_slot(src_slot, dst_slot, n_tokens);  // copies pos too
         if (kv_cache_) kv_cache_->clone_slot(src_slot, dst_slot, n_tokens);
         if (ssm_cache_) ssm_cache_->clone_slot(src_slot, dst_slot);
+        _tq_invalidate_watermarks(dst_slot);  // scratch for dst is stale
     }
 
 
@@ -98,7 +101,16 @@ private:
     std::unique_ptr<simple_kv_cache> kv_cache_;       // attention layers (null when TQ enabled)
     std::unique_ptr<ssm_state_cache> ssm_cache_;      // SSM layers (always present)
     std::unique_ptr<CompressedKVStore> tq_store_;     // TurboQuant compressed store (optional)
-    std::unique_ptr<simple_kv_cache> tq_scratch_cache_; // 1-layer F32 scratch for TQ
+    std::unique_ptr<simple_kv_cache> tq_scratch_cache_; // persistent F32 scratch for TQ (n_kv_layers)
+
+    // Per-KV-layer watermark: tq_scratch_valid_pos_[kv_idx][slot] = number of tokens
+    // already decompressed into the persistent scratch for this (kv_layer, slot).
+    std::vector<std::vector<uint32_t>> tq_scratch_valid_pos_;
+
+    void _tq_invalidate_watermarks(uint32_t slot_idx) {
+        for (auto& per_slot : tq_scratch_valid_pos_)
+            if (slot_idx < per_slot.size()) per_slot[slot_idx] = 0;
+    }
 
     // Physical layer index → cache layer index (-1 = not this cache type)
     std::vector<int32_t> kv_layer_map_;    // [24] → 0..5 or -1
