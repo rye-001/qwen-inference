@@ -1,5 +1,6 @@
 
 #include <iostream>
+#include <chrono>
 
 #include "complete.h"
 
@@ -74,17 +75,14 @@ int run_complete(
         }
 
         ggml_backend_sched_t scheduler = model.get_scheduler();
-        auto forward_pass = create_forward_pass(model, &model.get_metadata(), args.context_length);
+        auto forward_pass = create_forward_pass(model, &model.get_metadata(), args.context_length, 1, args.kv_quant_bits);
 
         // Prefill phase
-        ggml_backend_sched_reset(scheduler);            
-        ggml_cgraph* gf = forward_pass->build_prefill_graph(tokens, 0, 0); // Slot 0
-        ggml_backend_sched_alloc_graph(scheduler, gf);
-        forward_pass->set_inputs(gf, tokens, 0);
-        ggml_backend_sched_graph_compute(scheduler, gf);
-        forward_pass->advance_cache(tokens.size(), 0); // Slot 0
-
-        std::vector<float> logits = forward_pass->get_output_logits(gf);
+        using Clock = std::chrono::steady_clock;
+        const size_t n_prompt_tokens = tokens.size();
+        auto t_prefill_start = Clock::now();
+        std::vector<float> logits = forward_pass->run_prefill(tokens, 0, 0, scheduler);
+        auto t_prefill_end = Clock::now();
         size_t vocab_size = model.get_metadata().vocab_size;
         std::vector<float> last_token_logits(logits.end() - vocab_size, logits.end());
         int next_token_id = sampler->sample(last_token_logits, tokens, vocab);
@@ -104,6 +102,7 @@ int run_complete(
         // Speculative bridge for single-prompt mode (slot 0)
         SpeculativeBridge bridge{forward_pass.get(), scheduler};
         
+        auto t_decode_start = Clock::now();
         for (int i = 0; i < args.max_tokens; ++i) {
             std::string decoded_token = tokenizer->decode(next_token_id);
 
@@ -129,12 +128,7 @@ int run_complete(
                 std::vector<int32_t> current_token_vec = { next_token_id };
                 int decode_pos = forward_pass->get_cache_pos(slot);
 
-                ggml_backend_sched_reset(scheduler);
-                ggml_cgraph* gf_token = forward_pass->build_prefill_graph(current_token_vec, decode_pos, slot);
-                ggml_backend_sched_alloc_graph(scheduler, gf_token);
-                forward_pass->set_inputs(gf_token, current_token_vec, decode_pos);
-                ggml_backend_sched_graph_compute(scheduler, gf_token);
-                forward_pass->advance_cache(1, slot);
+                std::vector<float> decode_logits = forward_pass->run_prefill(current_token_vec, decode_pos, slot, scheduler);
 
                 // Try speculative
                 int after_decode_pos = forward_pass->get_cache_pos(slot);
@@ -170,8 +164,7 @@ int run_complete(
                         goto end_single_generation;
                     }
                 } else {
-                    std::vector<float> token_logits = forward_pass->get_output_logits(gf_token);
-                    last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
+                    last_token_logits.assign(decode_logits.begin(), decode_logits.begin() + vocab_size);
                     next_token_id = sampler->sample(last_token_logits, tokens, vocab);
                     if (grammar) {
                         grammar->accept_token(next_token_id, vocab);
@@ -183,15 +176,8 @@ int run_complete(
             // --- Normal decode path ---
             std::vector<int32_t> current_token_vec = { next_token_id };
             int current_pos = forward_pass->get_cache_pos(0); // Slot 0
-            
-            ggml_backend_sched_reset(scheduler);            
-            ggml_cgraph* gf_token = forward_pass->build_prefill_graph(current_token_vec, current_pos, 0); // Slot 0
-            ggml_backend_sched_alloc_graph(scheduler, gf_token);
-            forward_pass->set_inputs(gf_token, current_token_vec, current_pos);
-            ggml_backend_sched_graph_compute(scheduler, gf_token);
-            forward_pass->advance_cache(1, 0); // Slot 0
 
-            std::vector<float> token_logits = forward_pass->get_output_logits(gf_token);
+            std::vector<float> token_logits = forward_pass->run_prefill(current_token_vec, current_pos, 0, scheduler);
             last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
             
             next_token_id = sampler->sample(last_token_logits, tokens, vocab);
@@ -200,6 +186,30 @@ int run_complete(
             }
         }
         end_single_generation:
+        auto t_decode_end = Clock::now();
+
+        // Print timing
+        {
+            auto prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_prefill_end - t_prefill_start).count();
+            auto decode_ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_decode_end - t_decode_start).count();
+            const size_t n_decoded = generated_tokens.size();
+
+            double prefill_tps = (prefill_ms > 0)
+                ? (n_prompt_tokens * 1000.0 / prefill_ms) : 0.0;
+            double decode_tps  = (decode_ms  > 0 && n_decoded > 0)
+                ? (n_decoded * 1000.0 / decode_ms) : 0.0;
+
+            std::cout << "\n[Timing]"
+                      << " prefill=" << prefill_ms << "ms"
+                      << " (" << n_prompt_tokens << " tokens, "
+                      << static_cast<int>(prefill_tps) << " t/s)"
+                      << "  decode=" << decode_ms << "ms"
+                      << " (" << n_decoded << " tokens, "
+                      << static_cast<int>(decode_tps) << " t/s)"
+                      << std::endl;
+        }
 
         // Print PLD stats
         if (use_speculative) {

@@ -16,14 +16,7 @@ struct SpeculativeBridge {
         return [this, slot](int /*slot_id*/, const std::vector<int32_t>& draft, int start_pos)
             -> std::vector<float>
         {
-            ggml_backend_sched_reset(scheduler);
-            ggml_cgraph* gf = forward_pass->build_prefill_graph(
-                const_cast<std::vector<int32_t>&>(draft), start_pos, slot);
-            ggml_backend_sched_alloc_graph(scheduler, gf);
-            forward_pass->set_inputs(gf, const_cast<std::vector<int32_t>&>(draft), start_pos);
-            ggml_backend_sched_graph_compute(scheduler, gf);
-            forward_pass->advance_cache(draft.size(), slot);
-            return forward_pass->get_output_logits(gf);
+            return forward_pass->run_prefill(draft, start_pos, slot, scheduler);
         };
     }
 

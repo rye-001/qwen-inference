@@ -80,7 +80,7 @@ public:
 private:
     std::unique_ptr<simple_kv_cache> kv_cache_;
     std::unique_ptr<CompressedKVStore> tq_store_;
-    std::unique_ptr<simple_kv_cache> tq_scratch_cache_;  // 1-layer F32 for per-layer compute
+    std::unique_ptr<simple_kv_cache> tq_scratch_cache_;  // B-layer F32 scratch (one slot per attention layer in a batch)
 
     // Pre-computed RoPE tables
     std::vector<float> rope_cos_cached_;
@@ -94,18 +94,30 @@ private:
         int layer_idx, float kq_scale,
         uint32_t n_tokens, uint32_t slot_idx, int il);
 
-    // ── Per-layer graph builders (TurboQuant Phase 2) ──────────
+    // ── Per-layer / batched graph builders (TurboQuant Phase 2) ───
+    // Single-layer builder — kept for reference; run_prefill uses the batch variant.
     ggml_cgraph* _build_single_layer_graph(
         uint32_t il, const std::vector<int32_t>& tokens,
+        int pos, uint32_t slot_idx, uint32_t n_tokens,
+        uint32_t scratch_layer = 0);
+
+    // Batch builder: builds [il_start, il_end) layers in one ggml context.
+    // Each attention layer in the batch uses scratch cache slot scratch_idx (0-based).
+    ggml_cgraph* _build_layer_batch_graph(
+        uint32_t il_start, uint32_t il_end,
+        const std::vector<int32_t>& tokens,
         int pos, uint32_t slot_idx, uint32_t n_tokens);
 
     ggml_cgraph* _build_output_head_graph();
 
-    // Decompress full KV history for one layer from store → F32 cache (layer 0)
-    void _tq_decompress_layer(uint32_t layer, uint32_t slot_idx);
+    // Decompress full KV history for one model layer → scratch cache layer scratch_layer.
+    void _tq_decompress_layer(uint32_t layer, uint32_t slot_idx,
+                              uint32_t scratch_layer = 0);
 
-    // Compress newly written KV tokens from F32 cache (layer 0) → store
-    void _tq_compress_new(uint32_t layer, uint32_t slot_idx, uint32_t pos, uint32_t n_tokens);
+    // Compress newly written KV tokens from scratch cache layer scratch_layer → store.
+    void _tq_compress_new(uint32_t layer, uint32_t slot_idx,
+                          uint32_t pos, uint32_t n_tokens,
+                          uint32_t scratch_layer = 0);
 
     // Scratch buffer for inter-layer data transfer
     std::vector<float> tq_layer_scratch_;

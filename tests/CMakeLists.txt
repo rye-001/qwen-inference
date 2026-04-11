@@ -18,6 +18,7 @@ add_executable(qwen3-unit-tests
     unit/test_qwen35_forward_attn.cpp
     unit/test_qwen35_generation.cpp
     unit/test_grammar_vocab.cpp
+    unit/test_turboquant_generation.cpp
 )
 
 # Link libraries for unit tests
