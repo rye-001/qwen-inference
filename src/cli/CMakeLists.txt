@@ -1,11 +1,14 @@
 # Qwen-3 CLI Executable
 add_executable(qwen3-cli
+    complete.cpp
+    chat.cpp
     main.cpp
 )
 
 target_link_libraries(qwen3-cli PRIVATE
     qwen3-core
     qwen3-kv-cache
+    sampling
     ggml
     Threads::Threads
 )

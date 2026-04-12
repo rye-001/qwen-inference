@@ -212,9 +212,9 @@ size_t QwenGGUFLoader::calculate_tensor_bytes(const TensorMetadata &meta) const
 
 void QwenGGUFLoader::validate_architecture(const Qwen3Metadata &meta) const
 {
-    if (meta.architecture != "qwen3" && meta.architecture != "qwen2")
+    if (meta.architecture != "qwen3" && meta.architecture != "qwen2" && meta.architecture != "qwen35")
     {
-        throw GGUFLoadError("Invalid model architecture: " + meta.architecture + ", expected 'qwen3' or 'qwen2'");
+        throw GGUFLoadError("Invalid model architecture: " + meta.architecture + ", expected 'qwen3', 'qwen2' or 'qwen35'");
     }
     std::cout << "Validated model architecture: " << meta.architecture << std::endl;
 }
@@ -338,6 +338,27 @@ void QwenGGUFLoader::parse_and_validate_metadata(size_t& offset)
         } else if (key == KEY_TOKENIZER_ADD_BOS_TOKEN) {
             if (type != GGUFValueType::BOOL) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_ADD_BOS_TOKEN) + " has unexpected type.");
             metadata_.add_bos_token = read_value_from_mem<bool>(offset);
+        } else if (key == prefix + "ssm.conv_kernel") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.ssm_conv_kernel = read_value_from_mem<uint32_t>(offset);
+        } else if (key == prefix + "ssm.state_size") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.ssm_state_size = read_value_from_mem<uint32_t>(offset);
+        } else if (key == prefix + "ssm.group_count") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.ssm_group_count = read_value_from_mem<uint32_t>(offset);
+        } else if (key == prefix + "ssm.time_step_rank") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.ssm_time_step_rank = read_value_from_mem<uint32_t>(offset);
+        } else if (key == prefix + "ssm.inner_size") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.ssm_inner_size = read_value_from_mem<uint32_t>(offset);
+        } else if (key == prefix + "full_attention_interval") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.full_attention_interval = read_value_from_mem<uint32_t>(offset);
+        } else if (key == prefix + "rope.dimension_count") {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
+            metadata_.rope_dimension_count = read_value_from_mem<uint32_t>(offset);
         }
         else {
             skip_gguf_value_from_mem(offset, type);
@@ -401,25 +422,66 @@ void QwenGGUFLoader::validate_tensor_inventory() const
     std::cout << "Validating tensor inventory..." << std::endl;
     const auto &inventory = metadata_.tensor_inventory;
 
-    // A more robust validation: check for essential tensor groups rather than a fixed total count.
-    // Check for global tensors
+    // Global tensors
     if (inventory.find("token_embd.weight") == inventory.end()) {
         throw GGUFLoadError("Validation failed: Missing 'token_embd.weight'");
     }
     if (inventory.find("output_norm.weight") == inventory.end()) {
         throw GGUFLoadError("Validation failed: Missing 'output_norm.weight'");
     }
-    // Check tensors for each block
+
     for (uint32_t i = 0; i < metadata_.block_count; ++i) {
-        const std::vector<std::string> required_tensors = {
-            "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
-            "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight",
-            "ffn_up.weight", "ffn_down.weight"
-        };
-        for (const auto& t_name : required_tensors) {
-            const std::string full_name = "blk." + std::to_string(i) + "." + t_name;
-            if (inventory.find(full_name) == inventory.end()) {
-                throw GGUFLoadError("Validation failed: Missing tensor '" + full_name + "' for block " + std::to_string(i));
+        const std::string prefix = "blk." + std::to_string(i) + ".";
+
+        if (metadata_.architecture == "qwen35") {
+            // Shared tensors (both layer types)
+            const std::vector<std::string> shared_tensors = {
+                "attn_norm.weight", "post_attention_norm.weight",
+                "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"
+            };
+            for (const auto& t : shared_tensors) {
+                if (inventory.find(prefix + t) == inventory.end()) {
+                    throw GGUFLoadError("Validation failed: Missing '" + prefix + t + "'");
+                }
+            }
+
+            if (metadata_.is_full_attention_layer(i)) {
+                // Full attention layer tensors
+                const std::vector<std::string> attn_tensors = {
+                    "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                    "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
+                };
+                for (const auto& t : attn_tensors) {
+                    if (inventory.find(prefix + t) == inventory.end()) {
+                        throw GGUFLoadError("Validation failed: Missing '" + prefix + t + "' for attention layer " + std::to_string(i));
+                    }
+                }
+            } else {
+                // SSM (GatedDeltaNet) layer tensors
+                const std::vector<std::string> ssm_tensors = {
+                    "ssm_a", "ssm_conv1d.weight", "ssm_dt.bias",
+                    "ssm_alpha.weight", "ssm_beta.weight",
+                    "attn_qkv.weight", "attn_gate.weight",
+                    "ssm_norm.weight", "ssm_out.weight"
+                };
+                for (const auto& t : ssm_tensors) {
+                    if (inventory.find(prefix + t) == inventory.end()) {
+                        throw GGUFLoadError("Validation failed: Missing '" + prefix + t + "' for SSM layer " + std::to_string(i));
+                    }
+                }
+            }
+        } else {
+            // Original validation for qwen2/qwen3
+            const std::vector<std::string> required_tensors = {
+                "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight",
+                "ffn_up.weight", "ffn_down.weight"
+            };
+            for (const auto& t_name : required_tensors) {
+                const std::string full_name = prefix + t_name;
+                if (inventory.find(full_name) == inventory.end()) {
+                    throw GGUFLoadError("Validation failed: Missing tensor '" + full_name + "' for block " + std::to_string(i));
+                }
             }
         }
     }

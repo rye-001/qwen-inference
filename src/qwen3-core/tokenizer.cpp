@@ -91,27 +91,42 @@ Tokenizer::Tokenizer(const Qwen3Metadata* metadata) : metadata_(metadata) {
 
 
 void Tokenizer::initialize_special_tokens() {
-    // Add known special tokens based on GGUF metadata
+    // Add EOS from metadata
     special_tokens_["<|endoftext|>"] = metadata_->eos_token_id;
-    special_tokens_["<|im_start|>"] = 151644;  // Standard ChatML tokens for Qwen
-    special_tokens_["<|im_end|>"] = 151645;
-    
-    // Build reverse lookup for special token IDs
     special_token_ids_.insert(metadata_->eos_token_id);
-    special_token_ids_.insert(metadata_->bos_token_id);
-    special_token_ids_.insert(metadata_->padding_token_id);
-    special_token_ids_.insert(151644);  // <|im_start|>
-    special_token_ids_.insert(151645);  // <|im_end|>
-    
-    // Find all special tokens in vocabulary (typically have token_type != NORMAL)
+
+    // Insert bos/padding only if they were actually set in metadata
+    if (metadata_->bos_token_id >= 0) {
+        special_token_ids_.insert(metadata_->bos_token_id);
+    }
+    if (metadata_->padding_token_id >= 0) {
+        special_token_ids_.insert(metadata_->padding_token_id);
+    }
+
+    // Look up ChatML tokens from vocabulary instead of hardcoding IDs.
+    // This works for both qwen2/3 (where they're at 151644/151645)
+    // and qwen35 (where they're at different positions in the 248K vocab).
+    const std::vector<std::string> chatml_tokens = {
+        "<|im_start|>", "<|im_end|>"
+    };
+    for (const auto& tok_str : chatml_tokens) {
+        auto it = token_to_id_.find(tok_str);
+        if (it != token_to_id_.end()) {
+            special_tokens_[tok_str] = it->second;
+            special_token_ids_.insert(it->second);
+        }
+    }
+
+    // Find all special tokens in vocabulary (CONTROL or USER_DEFINED type)
     for (size_t i = 0; i < metadata_->token_types.size(); ++i) {
-        if (metadata_->token_types[i] == TokenType::CONTROL || 
+        if (metadata_->token_types[i] == TokenType::CONTROL ||
             metadata_->token_types[i] == TokenType::USER_DEFINED) {
             special_token_ids_.insert(static_cast<int32_t>(i));
             special_tokens_[metadata_->id_to_token[i]] = static_cast<int32_t>(i);
         }
     }
 }
+
 
 void Tokenizer::initialize_byte_mapping() {
     // Standard GPT-2 byte-level mapping to unique Unicode characters.
@@ -336,23 +351,40 @@ std::string Tokenizer::_decode_original_token(int32_t original_id) const {
     }
 
     const std::string& token = metadata_->id_to_token[original_id];
-    
+
     // Special tokens are returned as-is
     if (is_special_token(original_id)) {
         return token;
     }
-    
-    // Regular tokens need byte decoding
+
+    // Regular tokens need byte decoding.
+    // GPT-2 byte encoding maps byte values to Unicode characters, some of which
+    // are multi-byte in UTF-8 (e.g., space 0x20 → Ġ U+0120 → \xC4\xA0).
+    // We must try multi-byte lookups before single-byte.
     std::string result;
-    for (char c : token) {
-        auto decoder_it = byte_decoder_.find(std::string(1, c));
-        if (decoder_it != byte_decoder_.end()) {
-            result += static_cast<char>(decoder_it->second);
-        } else {
-            result += c;
+    size_t i = 0;
+    while (i < token.size()) {
+        // Try 2-byte UTF-8 sequence first (covers all GPT-2 byte mappings > 127)
+        if (i + 1 < token.size()) {
+            std::string two_byte = token.substr(i, 2);
+            auto it = byte_decoder_.find(two_byte);
+            if (it != byte_decoder_.end()) {
+                result += static_cast<char>(it->second);
+                i += 2;
+                continue;
+            }
         }
+        // Fall back to single-byte lookup
+        std::string one_byte(1, token[i]);
+        auto it = byte_decoder_.find(one_byte);
+        if (it != byte_decoder_.end()) {
+            result += static_cast<char>(it->second);
+        } else {
+            result += token[i];
+        }
+        i++;
     }
-    
+
     return result;
 }
 

@@ -49,7 +49,7 @@ set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 FetchContent_Declare(
   ggml
   GIT_REPOSITORY https://github.com/ggerganov/llama.cpp.git
-  GIT_TAG        b6697
+  GIT_TAG        b8390
   SOURCE_SUBDIR  ggml
 )
 
@@ -76,6 +76,7 @@ include_directories(${ggml_SOURCE_DIR}/include)
 # Core library components
 add_subdirectory(src/qwen3-core)
 add_subdirectory(src/kv-cache)
+add_subdirectory(src/sampling)
 
 # Main CLI executable
 add_subdirectory(src/cli)

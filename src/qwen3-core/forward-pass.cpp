@@ -1,70 +1,100 @@
 #include "forward-pass.h"
+#include "../kv-cache/turboquant.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include <iostream>
 #include <cmath>
 #include <cinttypes>
+#include <future>
+#include <thread>
 
-constexpr int GGML_ROPE_MODE_NORMAL = 0;
-
-constexpr size_t GRAPH_SIZE_METADATA = 128 * 1024 * 1024; // 64MB for graph nodes
 constexpr size_t GRAPH_SIZE = 16384;
 
-Qwen3ForwardPass::Qwen3ForwardPass(const Qwen3Model& model, const Qwen3Metadata* metadata, uint32_t context_len, uint32_t max_batch_size)
-    : meta_(*metadata), model_(model) {
-        kv_cache_ = nullptr;
+// Number of consecutive transformer layers fused into one ggml graph compute call.
+// Cuts Metal scheduler overhead and hidden-state CPU↔Metal round-trips by this factor.
+// Each layer has its own persistent scratch slot for incremental decompression.
+static constexpr uint32_t TQ_LAYER_BATCH = 4;
 
-        uint32_t n_embd_k, n_embd_v;
-        if (meta_.architecture == "qwen2") {
-            n_embd_k = meta_.embedding_length / meta_.attention_head_count * meta_.attention_head_count_kv;
-            n_embd_v = meta_.embedding_length / meta_.attention_head_count * meta_.attention_head_count_kv;
-        } else { // qwen3
-            n_embd_k = meta_.attention_key_length * meta_.attention_head_count_kv;
-            n_embd_v = meta_.attention_value_length * meta_.attention_head_count_kv;
+Qwen3ForwardPass::Qwen3ForwardPass(
+    const Qwen3Model& model, const Qwen3Metadata* metadata,
+    uint32_t context_len, uint32_t max_batch_size, int kv_quant_bits)
+    : ForwardPassBase(model, metadata) {
+        kv_cache_ = nullptr;
+        ggml_backend_t cache_backend = model_.has_metal_backend()
+            ? model_.get_backend_metal()
+            : model_.get_backend_cpu();
+
+            // === Qwen2/Qwen3 standard cache ===
+            uint32_t n_embd_k, n_embd_v;
+            if (meta_.architecture == "qwen2") {
+                n_embd_k = meta_.embedding_length / meta_.attention_head_count * meta_.attention_head_count_kv;
+                n_embd_v = meta_.embedding_length / meta_.attention_head_count * meta_.attention_head_count_kv;
+            } else { // qwen3
+                n_embd_k = meta_.attention_key_length * meta_.attention_head_count_kv;
+                n_embd_v = meta_.attention_value_length * meta_.attention_head_count_kv;
+            }
+
+            // TQ enabled: skip full F32 KV cache — only the 1-layer scratch is needed.
+            // Without TQ: allocate the standard full-size cache.
+            if (kv_quant_bits < 2) {
+                kv_cache_ = std::make_unique<simple_kv_cache>(
+                    meta_.block_count,
+                    context_len,
+                    max_batch_size,
+                    n_embd_k,
+                    n_embd_v,
+                    GGML_TYPE_F32,
+                    GGML_TYPE_F32,
+                    cache_backend
+                );
+            }
+
+            // TurboQuant compressed backing store + scratch cache (Phase 1 + 2)
+            if (kv_quant_bits >= 2 && kv_quant_bits <= 4) {
+                uint32_t head_dim = (meta_.architecture == "qwen2")
+                    ? meta_.embedding_length / meta_.attention_head_count
+                    : meta_.attention_key_length;
+                tq_store_ = std::make_unique<CompressedKVStore>(
+                    meta_.block_count,
+                    max_batch_size,
+                    context_len,
+                    n_embd_k, n_embd_v,
+                    head_dim, kv_quant_bits);
+
+                // Persistent scratch cache: one layer per model layer for incremental
+                // (delta) decompression. Only new tokens are decompressed + uploaded
+                // each decode step, turning O(context_length) into O(1).
+                const uint32_t scratch_layers = meta_.block_count;
+                tq_scratch_cache_ = std::make_unique<simple_kv_cache>(
+                    scratch_layers,
+                    context_len,
+                    max_batch_size,
+                    n_embd_k, n_embd_v,
+                    GGML_TYPE_F32, GGML_TYPE_F32,
+                    cache_backend);
+
+                // Watermarks: [n_layers][n_slots], all zero initially.
+                tq_scratch_valid_pos_.assign(scratch_layers,
+                    std::vector<uint32_t>(max_batch_size, 0));
+
+                size_t full_kv_mb = static_cast<size_t>(meta_.block_count) * max_batch_size
+                    * context_len * (n_embd_k + n_embd_v) * 4 / (1024 * 1024);
+                size_t tq_mb = tq_store_->total_compressed_bytes() / (1024 * 1024);
+                float scratch_mb = static_cast<float>(scratch_layers) * max_batch_size
+                    * context_len * (n_embd_k + n_embd_v) * 4 / (1024.0f * 1024.0f);
+                printf("TurboQuant KV compression: %d-bit (incremental decompress)\n", kv_quant_bits);
+                printf("  F32 KV (without TQ): %zu MB\n", full_kv_mb);
+                printf("  Compressed store:    %zu MB\n", tq_mb);
+                printf("  Scratch (%u layers): %.1f MB\n", scratch_layers, scratch_mb);
+                printf("  Compression ratio:   %.1fx\n",
+                       static_cast<float>(full_kv_mb) / tq_mb);
+            }
         }
 
-        kv_cache_ = std::make_unique<simple_kv_cache>(
-            meta_.block_count,
-            context_len,
-            max_batch_size,
-            n_embd_k,
-            n_embd_v,
-            GGML_TYPE_F32,
-            GGML_TYPE_F32,
-            model_.has_metal_backend() ? model_.get_backend_metal() : model_.get_backend_cpu()
-        );
-
-        // Pre-allocate persistent buffer for graph metadata
-        ctx_buffer_.resize(GRAPH_SIZE_METADATA);
-
-        struct ggml_init_params params = {
-            .mem_size   = ctx_buffer_.size(),
-            .mem_buffer = ctx_buffer_.data(),
-            .no_alloc   = true,
-        };
-        ctx_ = ggml_init(params);
-    }
-
-Qwen3ForwardPass::~Qwen3ForwardPass() {
-    if (ctx_) {
-        ggml_free(ctx_);
-    }
-}
-
 struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int32_t>& tokens, int pos, uint32_t slot_idx) {
-    // Reset context using persistent buffer (Zero Allocation)
-    if (ctx_) {
-        ggml_free(ctx_);
-    }
-    struct ggml_init_params params = {
-        .mem_size   = ctx_buffer_.size(),
-        .mem_buffer = ctx_buffer_.data(),
-        .no_alloc   = true, 
-    };
-    ctx_ = ggml_init(params);
-
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx_, GRAPH_SIZE, false);
+    reset_context();
+    ggml_cgraph* gf = new_graph();
     int n_layers = meta_.block_count;        // Layers 0-27
     int hidden_dim = meta_.embedding_length;    // Model dimension
     int n_head = meta_.attention_head_count;       // Query heads
@@ -200,7 +230,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
         set_tensor_name(gf, cur, "ffn_norm", il);
 
         // G. Feed-Forward Network (SwiGLU)
-        cur = _ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
+        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
         set_tensor_name(gf, cur, "ffn_output", il);
 
         // H. Residual connection after FFN
@@ -211,20 +241,8 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
         inpL = cur;
     }
 
-    cur = inpL;
-
     // 3. Final normalization and output projection
-    cur = build_norm(gf, cur, model_.get_output_norm_weight(), -1);
-    set_tensor_name(gf, cur, "final_norm");
-    
-    // Output projection (matmul with token_embd.weight or dedicated output matrix)
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
-    }
-    ggml_set_name(cur, "logits"); // Name output for retrieval
-    ggml_build_forward_expand(gf, cur);
+    build_output_head(gf, inpL);
 
     return gf;
 }
@@ -341,7 +359,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 
         // F. FFN
         cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-        cur = _ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
+        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
         
         // H. FFN Residual
         cur = ggml_add(ctx_, cur, ffn_inp);
@@ -361,26 +379,6 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 
     return gf;
 }
-
-ggml_tensor* Qwen3ForwardPass::_ffn_swiglu(
-    ggml_cgraph* gf,
-    ggml_tensor* cur,
-    ggml_tensor* gate,
-    ggml_tensor* up,
-    ggml_tensor* down,
-    int il
-) {
-
-    ggml_tensor * tmp = ggml_mul_mat(ctx_, up, cur);
-    set_tensor_name(gf, tmp, "ffn_up", il);
-    cur = ggml_mul_mat(ctx_, gate, cur);
-    set_tensor_name(gf, cur, "ffn_gate", il);
-    cur = ggml_swiglu_split(ctx_, cur, tmp);
-    set_tensor_name(gf, cur, "ffn_swiglu", il);
-    cur = ggml_mul_mat(ctx_, down, cur);
-    return cur;
-}
-
 
 ggml_tensor * Qwen3ForwardPass::_build_batched_attention_layer(
     ggml_cgraph * gf,
@@ -471,7 +469,7 @@ ggml_tensor * Qwen3ForwardPass::_build_batched_attention_layer(
         0);
         
     // 4. Compute Attention
-    return _build_attn_mha(gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
+    return build_attn_mha(gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
 }
 
 ggml_tensor * Qwen3ForwardPass::_build_attention_layer(
@@ -547,112 +545,10 @@ ggml_tensor * Qwen3ForwardPass::_build_attention_layer(
     ggml_build_forward_expand(gf, kq_mask);
 
     // 5. Execute attention with the cached values
-    ggml_tensor * cur = _build_attn_mha(gf, q, k, v, kq_mask, nullptr, kq_scale, pos, il);
+    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_mask, nullptr, kq_scale, pos, il);
     return cur;
 }
 
-
-ggml_tensor * Qwen3ForwardPass::_build_attn_mha(
-         ggml_cgraph * gf,
-         ggml_tensor * q,
-         ggml_tensor * k,
-         ggml_tensor * v,
-         ggml_tensor * kq_mask,
-         ggml_tensor * sinks,
-         float kq_scale,
-         uint32_t pos,
-        int il) const {
-    const bool v_trans = v->nb[1] > v->nb[2];
-
-    // split the batch into streams if needed
-    const auto n_stream = k->ne[3];
-
-    q = ggml_reshape_4d(ctx_, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream);
-    set_tensor_name(gf, q, "q_reshaped", il);
-
-    q = ggml_permute(ctx_, q, 0, 2, 1, 3);
-    set_tensor_name(gf, q, "q_permuted", il);
-    k = ggml_permute(ctx_, k, 0, 2, 1, 3);
-    set_tensor_name(gf, k, "k_permuted", il);
-    v = ggml_permute(ctx_, v, 1, 2, 0, 3);
-    set_tensor_name(gf, v, "v_permuted", il);
-    v = ggml_cont(ctx_, v);
-    set_tensor_name(gf, v, "v_cont", il);
-
-    const auto n_kv = k->ne[1];
-
-    ggml_tensor * cur;
-
-    {
-        ggml_tensor * kq = ggml_mul_mat(ctx_, k, q);
-        set_tensor_name(gf, kq, "kq", il);
-
-        // note: this op tends to require high floating point range
-        //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-
-        kq = ggml_soft_max_ext(ctx_, kq, kq_mask, kq_scale, 0/*hparams.f_max_alibi_bias*/);
-        set_tensor_name(gf, kq, "kq_soft", il);
-
-        ggml_soft_max_add_sinks(kq, sinks);
-
-        ggml_tensor * kqv = ggml_mul_mat(ctx_, v, kq);
-        set_tensor_name(gf, kqv, "kqv", il);
-
-        cur = ggml_permute(ctx_, kqv, 0, 2, 1, 3);
-        set_tensor_name(gf, cur, "kqv_permuted", il);
-
-        // recombine streams
-        cur = ggml_cont_2d(ctx_, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
-        set_tensor_name(gf, cur, "attn_recombined", il);    
-    }
-
-    return cur;
-}
-
-// Get output logits for a specific batch slot
-std::vector<float> Qwen3ForwardPass::get_output_logits_for_slot(ggml_cgraph* gf, uint32_t slot_index) {
-    ggml_tensor* logits_gpu = ggml_graph_get_tensor(gf, "logits");
-    if (!logits_gpu) {
-        throw std::runtime_error("logits tensor not found in graph");
-    }
-    
-    // logits shape: [vocab_size, batch_size]
-    uint32_t vocab_size = logits_gpu->ne[0];
-    uint32_t batch_size = logits_gpu->ne[1];
-    
-    if (slot_index >= batch_size) {
-        throw std::out_of_range("slot_index out of bounds for logits tensor");
-    }
-    
-    size_t offset_bytes = slot_index * vocab_size * sizeof(float);
-    std::vector<float> logits(vocab_size);
-    
-    ggml_backend_tensor_get(logits_gpu, logits.data(), offset_bytes, vocab_size * sizeof(float));
-    
-    return logits;
-}
-
-void Qwen3ForwardPass::set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il) const {
-    if (il != -1) {
-        char new_name[128];
-        snprintf(new_name, sizeof(new_name), "%s.%d", name, il);
-        ggml_set_name(tensor, new_name);
-    } else {
-        ggml_set_name(tensor, name);
-    }
-}
-
-ggml_tensor * Qwen3ForwardPass::build_norm(
-        ggml_cgraph * gf,
-        ggml_tensor * cur,
-        ggml_tensor * mw,
-        int   il) const {
-    cur = ggml_rms_norm(ctx_, cur, meta_.rms_norm_eps);
-    set_tensor_name(gf, cur, "cur_rms_normed", il);
-    cur = ggml_mul(ctx_, cur, mw);
-    return cur;
-}
 
 // Set input data AFTER allocation
 void Qwen3ForwardPass::set_inputs(ggml_cgraph* gf, 
@@ -785,45 +681,442 @@ for (uint32_t b = 0; b < n_tokens; ++b) {
     }
 }
 
-// Get output from GPU
-std::vector<float> Qwen3ForwardPass::get_output_logits(ggml_cgraph* gf) {
-    ggml_tensor* logits_gpu = ggml_graph_get_tensor(gf, "logits");
-    if (!logits_gpu) {
-        throw std::runtime_error("logits tensor not found in graph");
+// ============================================================================
+// TurboQuant Phase 2: Per-layer compute with compressed KV
+// ============================================================================
+
+void Qwen3ForwardPass::_tq_decompress_layer(uint32_t layer, uint32_t slot_idx,
+                                             uint32_t scratch_layer) {
+    const uint32_t pos = tq_store_->get_pos(slot_idx);
+    if (pos == 0) return;
+
+    // Incremental: only decompress tokens [watermark..pos).
+    const uint32_t watermark = tq_scratch_valid_pos_[layer][slot_idx];
+    if (watermark >= pos) return;  // scratch is already up-to-date
+    const uint32_t n_delta = pos - watermark;
+
+    const int n_embd_head = (meta_.architecture == "qwen3")
+        ? meta_.attention_key_length
+        : meta_.embedding_length / meta_.attention_head_count;
+    const int n_head_kv = meta_.attention_head_count_kv;
+    const int n_embd_k  = n_head_kv * n_embd_head;
+    const int n_embd_v  = n_head_kv * n_embd_head;
+
+    ggml_tensor* k_tensor = tq_scratch_cache_->get_k_cache_tensor(scratch_layer);
+    ggml_tensor* v_tensor = tq_scratch_cache_->get_v_cache_tensor(scratch_layer);
+
+    std::vector<float> k_buf(static_cast<size_t>(n_delta) * n_embd_k);
+    std::vector<float> v_buf(static_cast<size_t>(n_delta) * n_embd_v);
+
+    // Each token writes to a non-overlapping slice; reads from tq_store_ are
+    // at distinct offsets — safe to parallelise. Serial fast-path for n_delta < 4.
+    static constexpr uint32_t MIN_PAR_TOKENS = 4;
+    const uint32_t hw_threads =
+        std::max(1u, static_cast<uint32_t>(std::thread::hardware_concurrency()));
+    const uint32_t n_threads = (n_delta >= MIN_PAR_TOKENS)
+        ? std::min(n_delta, hw_threads) : 1u;
+
+    auto decompress_range = [&](uint32_t t0, uint32_t t1) {
+        for (uint32_t t = t0; t < t1; ++t) {
+            const uint32_t abs_pos = watermark + t;
+            tq_store_->decompress_token_k(layer, slot_idx, abs_pos,
+                k_buf.data() + t * n_embd_k);
+            tq_store_->decompress_token_v(layer, slot_idx, abs_pos,
+                v_buf.data() + t * n_embd_v);
+        }
+    };
+
+    if (n_threads == 1) {
+        decompress_range(0, n_delta);
+    } else {
+        const uint32_t chunk = (n_delta + n_threads - 1) / n_threads;
+        std::vector<std::future<void>> futures;
+        futures.reserve(n_threads);
+        for (uint32_t tid = 0; tid < n_threads; ++tid) {
+            const uint32_t t0 = tid * chunk;
+            const uint32_t t1 = std::min(t0 + chunk, n_delta);
+            if (t0 >= t1) break;
+            futures.push_back(std::async(std::launch::async, decompress_range, t0, t1));
+        }
+        for (auto& f : futures) f.get();
     }
-    
-    size_t logits_size = ggml_nbytes(logits_gpu);
-    std::vector<float> logits_cpu(logits_size / sizeof(float));
-    ggml_backend_tensor_get(logits_gpu, logits_cpu.data(), 0, logits_size);
-    
-    return logits_cpu;
+
+    // Upload only the delta range into the Metal buffer at the correct offset.
+    const size_t k_offset = slot_idx * k_tensor->nb[2]
+                          + static_cast<size_t>(watermark) * n_embd_k * sizeof(float);
+    const size_t v_offset = slot_idx * v_tensor->nb[2]
+                          + static_cast<size_t>(watermark) * n_embd_v * sizeof(float);
+
+    ggml_backend_tensor_set(k_tensor, k_buf.data(), k_offset,
+        static_cast<size_t>(n_delta) * n_embd_k * sizeof(float));
+    ggml_backend_tensor_set(v_tensor, v_buf.data(), v_offset,
+        static_cast<size_t>(n_delta) * n_embd_v * sizeof(float));
+
+    tq_scratch_valid_pos_[layer][slot_idx] = pos;
 }
 
+void Qwen3ForwardPass::_tq_compress_new(uint32_t layer, uint32_t slot_idx,
+                                         uint32_t pos, uint32_t n_tokens,
+                                         uint32_t scratch_layer) {
+    const int n_embd_head = (meta_.architecture == "qwen3")
+        ? meta_.attention_key_length
+        : meta_.embedding_length / meta_.attention_head_count;
+    const int n_head_kv = meta_.attention_head_count_kv;
+    const int n_embd_k  = n_head_kv * n_embd_head;
+    const int n_embd_v  = n_head_kv * n_embd_head;
 
-ggml_tensor* Qwen3ForwardPass::embedding(ggml_cgraph* gf, const std::vector<int32_t>& tokens) {
-    const size_t n_tokens = tokens.size();
+    ggml_tensor* k_tensor = tq_scratch_cache_->get_k_cache_tensor(scratch_layer);
+    ggml_tensor* v_tensor = tq_scratch_cache_->get_v_cache_tensor(scratch_layer);
 
-    // 1. Create a 1D tensor from the input token IDs
-    struct ggml_tensor* tokens_tensor = ggml_new_tensor_1d(
-        ctx_,
-        GGML_TYPE_I32,
-        n_tokens
-    );
-    
-    ggml_set_input(tokens_tensor);
-    set_tensor_name(gf, tokens_tensor, "tokens");
-    ggml_build_forward_expand(gf, tokens_tensor);
-    // memcpy(tokens_tensor->data, tokens.data(), ggml_nbytes(tokens_tensor));
+    // Bulk read: two tensor_get calls total instead of 2*n_tokens.
+    // Tokens pos..pos+n_tokens-1 are contiguous within a slot.
+    std::vector<float> k_buf(static_cast<size_t>(n_tokens) * n_embd_k);
+    std::vector<float> v_buf(static_cast<size_t>(n_tokens) * n_embd_v);
 
-    // 2. Perform the embedding lookup using ggml_get_rows
-    ggml_tensor * cur = ggml_get_rows(
-        ctx_,
-        model_.get_token_embedding_weight(),
-        tokens_tensor
-    );
+    ggml_backend_tensor_get(k_tensor, k_buf.data(),
+        slot_idx * k_tensor->nb[2] + pos * k_tensor->nb[1],
+        static_cast<size_t>(n_tokens) * n_embd_k * sizeof(float));
+    ggml_backend_tensor_get(v_tensor, v_buf.data(),
+        slot_idx * v_tensor->nb[2] + pos * v_tensor->nb[1],
+        static_cast<size_t>(n_tokens) * n_embd_v * sizeof(float));
 
-    ggml_set_name(cur, "embed_lookup");
-    return cur;
+    // compress_token_k/v copies to an internal scratch before turboquant::compress,
+    // so each call only touches its own slice — safe to parallelise across tokens.
+    static constexpr uint32_t MIN_PAR_TOKENS = 4;
+    const uint32_t hw_threads =
+        std::max(1u, static_cast<uint32_t>(std::thread::hardware_concurrency()));
+    const uint32_t n_threads = (n_tokens >= MIN_PAR_TOKENS)
+        ? std::min(n_tokens, hw_threads) : 1u;
+
+    auto compress_range = [&](uint32_t t0, uint32_t t1) {
+        for (uint32_t t = t0; t < t1; ++t) {
+            tq_store_->compress_token_k(layer, slot_idx, pos + t,
+                k_buf.data() + t * n_embd_k);
+            tq_store_->compress_token_v(layer, slot_idx, pos + t,
+                v_buf.data() + t * n_embd_v);
+        }
+    };
+
+    if (n_threads == 1) {
+        compress_range(0, n_tokens);
+    } else {
+        const uint32_t chunk = (n_tokens + n_threads - 1) / n_threads;
+        std::vector<std::future<void>> futures;
+        futures.reserve(n_threads);
+        for (uint32_t tid = 0; tid < n_threads; ++tid) {
+            const uint32_t t0 = tid * chunk;
+            const uint32_t t1 = std::min(t0 + chunk, n_tokens);
+            if (t0 >= t1) break;
+            futures.push_back(std::async(std::launch::async, compress_range, t0, t1));
+        }
+        for (auto& f : futures) f.get();
+    }
+
+    // Graph compute wrote new KV into the scratch; it's now valid up to pos + n_tokens.
+    tq_scratch_valid_pos_[layer][slot_idx] = pos + n_tokens;
 }
 
+ggml_cgraph* Qwen3ForwardPass::_build_single_layer_graph(
+    uint32_t il, const std::vector<int32_t>& tokens,
+    int pos, uint32_t slot_idx, uint32_t n_tokens,
+    uint32_t scratch_layer)
+{
+    reset_context();
+    ggml_cgraph* gf = new_graph();
+
+    int n_embd_head = (meta_.architecture == "qwen3")
+        ? meta_.attention_key_length
+        : meta_.embedding_length / meta_.attention_head_count;
+    int n_head = meta_.attention_head_count;
+    int n_head_kv = meta_.attention_head_count_kv;
+    int n_embd_k = n_head_kv * n_embd_head;
+    const int n_rot = n_embd_head;
+
+    auto& block = model_.get_block(il);
+
+    // Input hidden state — will be set via ggml_backend_tensor_set
+    ggml_tensor* inpL = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32,
+        meta_.embedding_length, n_tokens);
+    ggml_set_input(inpL);
+    ggml_set_name(inpL, "inpL");
+    ggml_build_forward_expand(gf, inpL);
+
+    // Position tensor
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp_pos);
+    ggml_set_name(inp_pos, "inp_pos");
+    ggml_build_forward_expand(gf, inp_pos);
+
+    ggml_tensor* inpSA = inpL;
+    ggml_tensor* cur;
+
+    // A. RMS Normalization before attention
+    cur = build_norm(gf, inpL, block.attn_norm_weight, il);
+
+    // B. Q, K, V projections
+    ggml_tensor* Qcur = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
+    if (meta_.architecture == "qwen2") Qcur = ggml_add(ctx_, Qcur, block.attn_q_bias);
+    ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
+    if (meta_.architecture == "qwen2") Kcur = ggml_add(ctx_, Kcur, block.attn_k_bias);
+    ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
+    if (meta_.architecture == "qwen2") Vcur = ggml_add(ctx_, Vcur, block.attn_v_bias);
+
+    Qcur = ggml_reshape_3d(ctx_, Qcur, n_embd_head, n_head, n_tokens);
+    Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+    if (meta_.architecture == "qwen3") {
+        Qcur = build_norm(gf, Qcur, block.attn_q_norm_weight, il);
+        Kcur = build_norm(gf, Kcur, block.attn_k_norm_weight, il);
+    }
+
+    // RoPE
+    float freq_base = meta_.rope_freq_base;
+    Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
+        meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
+        meta_.context_length, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+    // C. Attention
+    float kq_scale = 1.0f / sqrtf(float(n_embd_head));
+    cur = _build_attention_layer(gf, tq_scratch_cache_.get(), Qcur, Kcur, Vcur,
+        scratch_layer, kq_scale, n_tokens, slot_idx, il);
+
+    // D. Output projection + residual
+    cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
+    ggml_tensor* ffn_inp = ggml_add(ctx_, cur, inpSA);
+
+    // E. FFN
+    cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
+    cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
+        block.ffn_down_weight, il);
+
+    // F. FFN residual
+    cur = ggml_add(ctx_, cur, ffn_inp);
+    ggml_set_name(cur, "layer_out");
+    ggml_build_forward_expand(gf, cur);
+
+    return gf;
+}
+
+ggml_cgraph* Qwen3ForwardPass::_build_output_head_graph() {
+    reset_context();
+    ggml_cgraph* gf = new_graph();
+    // We'll handle this inline in run_prefill instead.
+    return gf;
+}
+
+// Build a fused graph for layers [il_start, il_end) in one ggml context.
+// Each attention layer in the batch is assigned an incrementing scratch_layer index
+// so it reads/writes a distinct slot of tq_scratch_cache_.
+// Input tensor: "inpL"  (hidden state before il_start)
+// Output tensor: "layer_out" (hidden state after il_end - 1)
+ggml_cgraph* Qwen3ForwardPass::_build_layer_batch_graph(
+    uint32_t il_start, uint32_t il_end,
+    const std::vector<int32_t>& /*tokens*/,
+    int /*pos*/, uint32_t slot_idx, uint32_t n_tokens)
+{
+    reset_context();
+    ggml_cgraph* gf = new_graph();
+
+    const int n_embd_head = (meta_.architecture == "qwen3")
+        ? static_cast<int>(meta_.attention_key_length)
+        : static_cast<int>(meta_.embedding_length / meta_.attention_head_count);
+    const int n_head    = static_cast<int>(meta_.attention_head_count);
+    const int n_head_kv = static_cast<int>(meta_.attention_head_count_kv);
+    const int n_rot     = n_embd_head;
+    const float freq_base = meta_.rope_freq_base;
+
+    // Shared inputs — set once, used by every layer in the batch
+    ggml_tensor* inpL = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32,
+        meta_.embedding_length, n_tokens);
+    ggml_set_input(inpL);
+    ggml_set_name(inpL, "inpL");
+    ggml_build_forward_expand(gf, inpL);
+
+    ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp_pos);
+    ggml_set_name(inp_pos, "inp_pos");
+    ggml_build_forward_expand(gf, inp_pos);
+
+    ggml_tensor* cur = inpL;
+
+    for (uint32_t il = il_start; il < il_end; ++il) {
+        auto& block  = model_.get_block(il);
+        ggml_tensor* inpSA = cur;
+
+        // Pre-attention norm
+        cur = build_norm(gf, cur, block.attn_norm_weight, il);
+
+        // Q, K, V projections
+        ggml_tensor* Qcur = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
+        ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
+        ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
+        if (meta_.architecture == "qwen2") {
+            Qcur = ggml_add(ctx_, Qcur, block.attn_q_bias);
+            Kcur = ggml_add(ctx_, Kcur, block.attn_k_bias);
+            Vcur = ggml_add(ctx_, Vcur, block.attn_v_bias);
+        }
+
+        Qcur = ggml_reshape_3d(ctx_, Qcur, n_embd_head, n_head,    n_tokens);
+        Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+        if (meta_.architecture == "qwen3") {
+            Qcur = build_norm(gf, Qcur, block.attn_q_norm_weight, il);
+            Kcur = build_norm(gf, Kcur, block.attn_k_norm_weight, il);
+        }
+
+        // RoPE
+        Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr, n_rot,
+            GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base,
+            1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr, n_rot,
+            GGML_ROPE_TYPE_NEOX, meta_.context_length, freq_base,
+            1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+        // Attention — each layer uses its persistent scratch cache slot (il)
+        const float kq_scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
+        cur = _build_attention_layer(gf, tq_scratch_cache_.get(), Qcur, Kcur, Vcur,
+            il, kq_scale, n_tokens, slot_idx, il);
+
+        // Output projection + residuals
+        cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
+        ggml_tensor* ffn_inp = ggml_add(ctx_, cur, inpSA);
+
+        cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
+        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
+            block.ffn_down_weight, il);
+        cur = ggml_add(ctx_, cur, ffn_inp);
+    }
+
+    ggml_set_name(cur, "layer_out");
+    ggml_build_forward_expand(gf, cur);
+    return gf;
+}
+
+std::vector<float> Qwen3ForwardPass::run_prefill(
+    const std::vector<int32_t>& tokens,
+    int pos, uint32_t slot_idx,
+    ggml_backend_sched_t scheduler)
+{
+    // If TQ not enabled, use the default monolithic path
+    if (!tq_store_) {
+        return ForwardPassBase::run_prefill(tokens, pos, slot_idx, scheduler);
+    }
+
+    const uint32_t n_layers = meta_.block_count;
+    const uint32_t n_tokens = tokens.size();
+    const int hidden_dim = meta_.embedding_length;
+
+    // Scratch for hidden state between layers
+    std::vector<float> hidden(static_cast<size_t>(hidden_dim) * n_tokens);
+
+    // ── Token embeddings via ggml (handles quantized weights correctly) ──
+    // Direct ggml_backend_tensor_get on the embedding weight would compute
+    // wrong byte offsets for quantized (Q4_K etc.) tensors. Use ggml_get_rows.
+    {
+        reset_context();
+        ggml_cgraph* gf_emb = new_graph();
+        ggml_tensor* emb = embedding(gf_emb, tokens);
+        ggml_build_forward_expand(gf_emb, emb);
+
+        ggml_backend_sched_reset(scheduler);
+        ggml_backend_sched_alloc_graph(scheduler, gf_emb);
+
+        ggml_tensor* tok_tensor = ggml_graph_get_tensor(gf_emb, "tokens");
+        ggml_backend_tensor_set(tok_tensor, tokens.data(), 0, n_tokens * sizeof(int32_t));
+
+        ggml_backend_sched_graph_compute(scheduler, gf_emb);
+
+        ggml_tensor* emb_out = ggml_graph_get_tensor(gf_emb, "embed_lookup");
+        ggml_backend_tensor_get(emb_out, hidden.data(), 0,
+            static_cast<size_t>(hidden_dim) * n_tokens * sizeof(float));
+    }
+
+    // Sync scratch cache position with TQ store's position tracker
+    tq_scratch_cache_->set_pos(tq_store_->get_pos(slot_idx), slot_idx);
+
+    // Pre-compute position IDs (same for every batch)
+    std::vector<int32_t> pos_data(n_tokens);
+    for (uint32_t i = 0; i < n_tokens; ++i) pos_data[i] = pos + i;
+
+    // ── Batched layer compute ────────────────────────────────────────────
+    // TQ_LAYER_BATCH layers share one graph_compute call → cuts scheduler
+    // overhead and hidden-state CPU↔Metal round-trips by TQ_LAYER_BATCH×.
+    for (uint32_t il0 = 0; il0 < n_layers; il0 += TQ_LAYER_BATCH) {
+        const uint32_t il1 = std::min(il0 + TQ_LAYER_BATCH, n_layers);
+
+        // 1. Decompress KV delta for each layer into its persistent scratch slot
+        for (uint32_t il = il0; il < il1; ++il)
+            _tq_decompress_layer(il, slot_idx, il);
+
+        // 2. Build fused graph for [il0, il1)
+        ggml_cgraph* gf = _build_layer_batch_graph(il0, il1, tokens, pos, slot_idx, n_tokens);
+
+        // 3. Allocate and set inputs
+        ggml_backend_sched_reset(scheduler);
+        ggml_backend_sched_alloc_graph(scheduler, gf);
+
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inp_pos"),
+            pos_data.data(), 0, n_tokens * sizeof(int32_t));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inpL"),
+            hidden.data(), 0,
+            static_cast<size_t>(hidden_dim) * n_tokens * sizeof(float));
+
+        // Set one causal mask per layer in the batch
+        for (uint32_t il = il0; il < il1; ++il) {
+            char mask_name[32];
+            snprintf(mask_name, sizeof(mask_name), "kq_mask.%d", il);
+            ggml_tensor* kq_mask = ggml_graph_get_tensor(gf, mask_name);
+            if (!kq_mask) continue;
+            const uint32_t n_kv = kq_mask->ne[0];
+            std::vector<float> mask_data(n_kv * n_tokens);
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const uint32_t q_pos = pos + i;
+                for (uint32_t j = 0; j < n_kv; ++j)
+                    mask_data[i * n_kv + j] = (j <= q_pos) ? 0.0f : -INFINITY;
+            }
+            ggml_backend_tensor_set(kq_mask, mask_data.data(), 0,
+                n_kv * n_tokens * sizeof(float));
+        }
+
+        // 4. One compute call for all layers in batch
+        ggml_backend_sched_graph_compute(scheduler, gf);
+
+        // 5. Read back hidden state once per batch (not once per layer)
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "layer_out"),
+            hidden.data(), 0,
+            static_cast<size_t>(hidden_dim) * n_tokens * sizeof(float));
+
+        // 6. Compress KV for each layer from its persistent scratch slot
+        for (uint32_t il = il0; il < il1; ++il)
+            _tq_compress_new(il, slot_idx, tq_store_->get_pos(slot_idx), n_tokens, il);
+    }
+
+    // ── Output head ──────────────────────────────────────────────────────
+    // Build a minimal graph for final norm + LM head
+    reset_context();
+    ggml_cgraph* gf_out = new_graph();
+
+    ggml_tensor* final_in = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32,
+        hidden_dim, n_tokens);
+    ggml_set_input(final_in);
+    ggml_set_name(final_in, "final_in");
+    ggml_build_forward_expand(gf_out, final_in);
+
+    build_output_head(gf_out, final_in);
+
+    ggml_backend_sched_reset(scheduler);
+    ggml_backend_sched_alloc_graph(scheduler, gf_out);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_out, "final_in"),
+        hidden.data(), 0,
+        static_cast<size_t>(hidden_dim) * n_tokens * sizeof(float));
+    ggml_backend_sched_graph_compute(scheduler, gf_out);
+
+    // Advance the TQ position tracker (sequence length source of truth)
+    tq_store_->advance(slot_idx, n_tokens);
+
+    return get_output_logits(gf_out);
+}
 

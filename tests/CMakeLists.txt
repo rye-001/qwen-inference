@@ -10,12 +10,22 @@ FetchContent_MakeAvailable(googletest)
 add_executable(qwen3-unit-tests
     unit/test_tokenizer.cpp
     unit/test_vocab_file_loading.cpp
+    unit/test_qwen35_metadata.cpp
+    unit/test_qwen35_tensor_loading.cpp
+    unit/test_ssm_state_cache.cpp
+    unit/test_qwen35_tokenizer.cpp
+    unit/test_qwen35_hybrid_cache.cpp
+    unit/test_qwen35_forward_attn.cpp
+    unit/test_qwen35_generation.cpp
+    unit/test_grammar_vocab.cpp
+    unit/test_turboquant_generation.cpp
 )
 
 # Link libraries for unit tests
 target_link_libraries(qwen3-unit-tests PRIVATE
     GTest::gtest_main
     qwen3-core
+    sampling
     ggml
 )
 
@@ -32,6 +42,7 @@ add_executable(qwen3-integration-tests
 target_link_libraries(qwen3-integration-tests PRIVATE
     GTest::gtest_main
     qwen3-core
+    sampling
     ggml
 )
 
@@ -46,6 +57,7 @@ add_executable(qwen3-order-mngmt-test
 # Link libraries
 target_link_libraries(qwen3-order-mngmt-test PRIVATE
     qwen3-core
+    sampling
     ggml
 )
 
@@ -57,6 +69,42 @@ add_executable(qwen3-parallel-order-mngmt-test
 # Link libraries
 target_link_libraries(qwen3-parallel-order-mngmt-test PRIVATE
     qwen3-core
+    sampling
+    ggml
+)
+
+# TurboQuant unit tests (GTest, no model needed)
+add_executable(qwen3-turboquant-tests
+    unit/test_turboquant.cpp
+)
+
+target_link_libraries(qwen3-turboquant-tests PRIVATE
+    GTest::gtest_main
+    qwen3-kv-cache
+)
+
+gtest_discover_tests(qwen3-turboquant-tests)
+
+# Compressed KV store unit tests (GTest, no model needed)
+add_executable(qwen3-compressed-kv-tests
+    unit/test_compressed_kv_store.cpp
+)
+
+target_link_libraries(qwen3-compressed-kv-tests PRIVATE
+    GTest::gtest_main
+    qwen3-kv-cache
+)
+
+gtest_discover_tests(qwen3-compressed-kv-tests)
+
+# Parallel grammar test (Non-GTest)
+add_executable(qwen3-parallel-grammar-test
+    integration/test_parallel_grammar.cpp
+)
+
+target_link_libraries(qwen3-parallel-grammar-test PRIVATE
+    qwen3-core
+    sampling
     ggml
 )
 
