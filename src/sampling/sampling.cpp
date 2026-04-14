@@ -19,11 +19,25 @@ void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
     }
 }
 
+void Sampler::build_token_trie(const std::vector<std::string>& vocab) {
+    token_trie_ = std::make_unique<TokenTrie>();
+    token_trie_->build(vocab);
+}
+
 void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::vector<int32_t>& last_tokens,
                                         const std::vector<std::string>& token_strs) {
     if (!grammar_) return;
 
-    // vocab-scan, no pretokenized map.
+    // Lazily build the trie on first grammar use if not yet built.
+    if (!token_trie_ && !token_strs.empty()) {
+        build_token_trie(token_strs);
+    }
+    // Attach trie to grammar for accelerated lookups.
+    if (token_trie_) {
+        grammar_->set_token_trie(token_trie_.get());
+    }
+
+    // vocab-scan (trie-accelerated when available).
     std::vector<int32_t> valid_tokens = grammar_->get_valid_tokens(token_strs);
 
     if (valid_tokens.empty()) {

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -533,30 +534,76 @@ bool GrammarVocab::is_accepting_state() const {
 std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::string>& vocab) const {
     std::set<int32_t> valid_set;
 
-    for (const auto& state : impl_->stacks) {
-        if (!state.pos) continue;
+    if (trie_) {
+        // ---- Grouped trie path: deduplicate queries across active states ----
 
-        if (state.pos->type == Elem::LITERAL) {
-            const std::string& lit = impl_->literal_values[state.pos->value];
-            if (state.char_idx >= lit.size()) continue;
+        // Group LITERAL states by (literal_value_index, char_idx) so states
+        // with the same remaining prefix share a single trie walk.
+        // Key: (literal_value_index << 32) | char_idx
+        std::map<uint64_t, std::vector<const Impl::GrammarState*>> literal_groups;
+        // Group CHAR_CLASS states by class index — same class = same query.
+        std::map<uint32_t, bool> cc_seen;  // class_id → already queried
 
-            if (trie_) {
-                // Trie fast path: collect only candidate tokens whose string
-                // could possibly match the remaining literal suffix.
+        for (const auto& state : impl_->stacks) {
+            if (!state.pos) continue;
+
+            if (state.pos->type == Elem::LITERAL) {
+                const std::string& lit = impl_->literal_values[state.pos->value];
+                if (state.char_idx >= lit.size()) continue;
+                uint64_t key = (static_cast<uint64_t>(state.pos->value) << 32)
+                             | static_cast<uint64_t>(state.char_idx);
+                literal_groups[key].push_back(&state);
+
+            } else if (state.pos->type == Elem::CHAR_CLASS) {
+                uint32_t cc_id = state.pos->value;
+                if (cc_seen.count(cc_id)) continue;  // already queried
+                cc_seen[cc_id] = true;
+
+                const auto& cc = impl_->char_classes[cc_id];
                 std::vector<int32_t> candidates;
-                trie_->collect_by_prefix(lit, state.char_idx, candidates);
+                trie_->collect_by_char_class(cc.first, cc.second, candidates);
+                for (int32_t tok_id : candidates)
+                    valid_set.insert(tok_id);
+            }
+        }
 
-                for (int32_t tok_id : candidates) {
+        // Execute one trie walk per unique (literal, char_idx), then run
+        // consume_token for each state in the group on the shared candidates.
+        for (const auto& [key, states] : literal_groups) {
+            uint32_t lit_id   = static_cast<uint32_t>(key >> 32);
+            size_t   char_idx = static_cast<size_t>(key & 0xFFFFFFFF);
+            const std::string& lit = impl_->literal_values[lit_id];
+
+            std::vector<int32_t> candidates;
+            trie_->collect_by_prefix(lit, char_idx, candidates);
+
+            for (int32_t tok_id : candidates) {
+                // Skip if already known valid (avoid redundant consume_token)
+                if (valid_set.count(tok_id)) continue;
+
+                for (const auto* st : states) {
                     std::vector<Impl::GrammarState> result;
                     Impl::consume_token(impl_.get(), vocab[tok_id], 0,
-                                        state.pos, state.char_idx,
-                                        state.continuations, result);
-                    if (!result.empty())
+                                        st->pos, st->char_idx,
+                                        st->continuations, result);
+                    if (!result.empty()) {
                         valid_set.insert(tok_id);
+                        break;  // one state accepting suffices
+                    }
                 }
-            } else {
-                // Brute-force fallback: scan all vocab tokens
+            }
+        }
+
+    } else {
+        // ---- Brute-force fallback (no trie) ----
+        for (const auto& state : impl_->stacks) {
+            if (!state.pos) continue;
+
+            if (state.pos->type == Elem::LITERAL) {
+                const std::string& lit = impl_->literal_values[state.pos->value];
+                if (state.char_idx >= lit.size()) continue;
                 const char expected_first = lit[state.char_idx];
+
                 for (size_t i = 0; i < vocab.size(); ++i) {
                     if (vocab[i].empty()) continue;
                     if (vocab[i][0] != expected_first) continue;
@@ -568,19 +615,9 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
                     if (!result.empty())
                         valid_set.insert(static_cast<int32_t>(i));
                 }
-            }
 
-        } else if (state.pos->type == Elem::CHAR_CLASS) {
-            const auto& cc = impl_->char_classes[state.pos->value];
-
-            if (trie_) {
-                // Trie fast path for CHAR_CLASS
-                std::vector<int32_t> candidates;
-                trie_->collect_by_char_class(cc.first, cc.second, candidates);
-                for (int32_t tok_id : candidates)
-                    valid_set.insert(tok_id);
-            } else {
-                // Brute-force fallback
+            } else if (state.pos->type == Elem::CHAR_CLASS) {
+                const auto& cc = impl_->char_classes[state.pos->value];
                 for (size_t i = 0; i < vocab.size(); ++i) {
                     if (vocab[i].empty()) continue;
                     const char fc = vocab[i][0];
@@ -590,7 +627,6 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
                 }
             }
         }
-        // END state: grammar accepting, contributes no further tokens
     }
 
     return {valid_set.begin(), valid_set.end()};

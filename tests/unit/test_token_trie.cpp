@@ -612,3 +612,67 @@ TEST(TokenTrieGrammar, Equivalence_CharClassDigitSequence) {
         {T_IF, T_SPACE, T_LPAREN, T_ORDERS, T_DOT, T_LENGTH, T_GT, T_5, T_3},
         "CHAR_CLASS after multi-digit '53'");
 }
+
+// --- Phase 4: Multi-state optimization tests ---
+// These exercise grammars where multiple active states share the same
+// remaining prefix, verifying grouped trie queries produce identical results.
+
+TEST(TokenTrieGrammar, MultiState_OverlappingAwaitPrefixes) {
+    // Initial state has both await_call and parallel_block starting with "await".
+    // The grouped optimization should deduplicate the "await" trie walk.
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    // Initial state — multiple alternatives active, two start with "await"
+    assert_equivalence_at(gbnf, vocab, trie, {}, "overlapping await prefixes at root");
+}
+
+TEST(TokenTrieGrammar, MultiState_ManyAlternativesAtFunctionName) {
+    // At function_name position, 5 LITERAL alternatives are active simultaneously:
+    // "getAccounts", "getSupportTickets", "getOpenOrders", "reassignAccount", "addAccountNote"
+    // Three share "get" prefix. Grouped query should walk "get" subtree once.
+    auto vocab = build_grammar_vocab();
+    auto gbnf = load_test_gbnf();
+    TokenTrie trie;
+    trie.build(vocab);
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_CONST, T_SPACE, T_ACCOUNTS, T_SPACE, T_EQ, T_SPACE,
+         T_AWAIT, T_SPACE},
+        "5 function_name alternatives active");
+}
+
+TEST(TokenTrieGrammar, MultiState_DuplicateLiteralsInAlternatives) {
+    // Grammar where the same literal appears in multiple alternatives
+    auto vocab = build_grammar_vocab();
+    std::string gbnf = R"GBNF(
+root ::= a | b | c
+a ::= "const" " " "accounts"
+b ::= "const" " " "orders"
+c ::= "for" " " "accounts"
+)GBNF";
+    TokenTrie trie;
+    trie.build(vocab);
+    // At initial state: two states expect "const", one expects "for"
+    // Grouped optimization deduplicates the "const" trie walk
+    assert_equivalence_at(gbnf, vocab, trie, {},
+        "duplicate 'const' literals across alternatives");
+    // After "const " — two states active, both at different next literals
+    assert_equivalence_at(gbnf, vocab, trie,
+        {T_CONST, T_SPACE},
+        "after 'const ' with two active alternatives");
+}
+
+TEST(TokenTrieGrammar, MultiState_MixedLiteralAndCharClass) {
+    // Grammar where LITERAL and CHAR_CLASS states are active simultaneously
+    auto vocab = build_grammar_vocab();
+    std::string gbnf = R"GBNF(
+root ::= num_or_word
+num_or_word ::= [0-9] [0-9]* | "const"
+)GBNF";
+    TokenTrie trie;
+    trie.build(vocab);
+    // Initial state: CHAR_CLASS [0-9] and LITERAL "const" both active
+    assert_equivalence_at(gbnf, vocab, trie, {},
+        "mixed LITERAL + CHAR_CLASS at root");
+}
