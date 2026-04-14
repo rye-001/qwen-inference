@@ -69,6 +69,11 @@ public:
         return kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
     }
 
+    uint32_t get_physical_cache_pos(uint32_t slot_idx) const override {
+        if (tq_store_) return tq_store_->get_pos(slot_idx);
+        return kv_cache_ ? kv_cache_->get_pos(slot_idx) : 0;
+    }
+
     void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) override {
         if (tq_store_) tq_store_->clone_slot(src_slot, dst_slot, n_tokens);  // copies pos too
         if (kv_cache_) kv_cache_->clone_slot(src_slot, dst_slot, n_tokens);

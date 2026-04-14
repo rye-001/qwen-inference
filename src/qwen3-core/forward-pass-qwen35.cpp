@@ -1032,11 +1032,13 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
     ggml_build_forward_expand(gf, inp_pos);
 
     // 3. Attention mask + gather indices (used by attention layers only)
-    uint32_t max_pos = 0;
-    for (int32_t p : positions) {
-        if (p > (int32_t)max_pos) max_pos = (uint32_t)p;
+    // Use physical cache positions for KV sizing (after SnapKV, logical pos > physical pos).
+    uint32_t max_physical = 0;
+    for (uint32_t s : slots) {
+        uint32_t phys = get_physical_cache_pos(s);
+        if (phys > max_physical) max_physical = phys;
     }
-    uint32_t n_kv_len = max_pos + 1;
+    uint32_t n_kv_len = max_physical + 1;
 
     ggml_tensor* kq_mask = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
         n_kv_len, 1, 1, n_batch);

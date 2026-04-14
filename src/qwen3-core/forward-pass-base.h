@@ -36,6 +36,11 @@ public:
     virtual void clear_slot(uint32_t slot_idx) = 0;
     virtual void set_cache_pos(uint32_t pos, uint32_t slot_idx) = 0;
     virtual uint32_t get_cache_pos(uint32_t slot_idx) const = 0;
+
+    // Physical cache position (KV write offset / attention entry count).
+    // Unlike get_cache_pos(), this always returns the physical position even
+    // when SnapKV seq_pos tracking is active. Used for KV gather sizing.
+    virtual uint32_t get_physical_cache_pos(uint32_t slot_idx) const = 0;
     virtual void clone_slot(uint32_t src_slot, uint32_t dst_slot, uint32_t n_tokens) = 0;
     virtual ggml_cgraph* build_decoding_graph(
         const std::vector<int32_t>& tokens,

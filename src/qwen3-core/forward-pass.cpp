@@ -292,12 +292,15 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
     set_tensor_name(gf, inp_pos, "inp_pos");
     ggml_build_forward_expand(gf, inp_pos);
 
-    // Find max position to determine Mask/Gather length
-    uint32_t max_pos = 0;
-    for (int32_t p : positions) {
-        if (p > (int32_t)max_pos) max_pos = (uint32_t)p;
+    // Find max physical cache position to determine KV gather length.
+    // After SnapKV, positions[] contains logical (RoPE) positions which may be
+    // much larger than the compacted cache. Use the physical cache pos instead.
+    uint32_t max_physical = 0;
+    for (uint32_t s : slots) {
+        uint32_t phys = get_physical_cache_pos(s);
+        if (phys > max_physical) max_physical = phys;
     }
-    uint32_t n_kv_len = max_pos + 1;
+    uint32_t n_kv_len = max_physical + 1;  // +1 for the new token being written
 
     // Attention Mask (shared across layers)
     // Shape: [n_kv_len, n_tokens, 1]
