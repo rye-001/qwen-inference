@@ -135,6 +135,18 @@ target_link_libraries(qwen3-snapkv-position-tests PRIVATE
 
 gtest_discover_tests(qwen3-snapkv-position-tests)
 
+# TokenTrie unit tests (GTest, no model needed)
+add_executable(qwen3-token-trie-tests
+    unit/test_token_trie.cpp
+)
+
+target_link_libraries(qwen3-token-trie-tests PRIVATE
+    GTest::gtest_main
+    sampling
+)
+
+gtest_discover_tests(qwen3-token-trie-tests)
+
 # Parallel grammar test (Non-GTest)
 add_executable(qwen3-parallel-grammar-test
     integration/test_parallel_grammar.cpp
