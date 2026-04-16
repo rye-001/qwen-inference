@@ -174,3 +174,6 @@ target_link_libraries(qwen3-http-server-test PRIVATE
 
 target_compile_features(qwen3-http-server-test PRIVATE cxx_std_17)
 gtest_discover_tests(qwen3-http-server-test)
+
+# Grammar regression tests (non-GTest standalone executables)
+add_subdirectory(grammar)

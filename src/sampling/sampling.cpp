@@ -37,7 +37,6 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::v
         grammar_->set_token_trie(token_trie_.get());
     }
 
-    // vocab-scan (trie-accelerated when available).
     std::vector<int32_t> valid_tokens = grammar_->get_valid_tokens(token_strs);
 
     if (valid_tokens.empty()) {
@@ -53,7 +52,6 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::v
 
         for (size_t i = 0; i < logits.size(); ++i)
             logits[i] = -std::numeric_limits<float>::infinity();
-        // Find EOS by scanning vocab strings — no hardcoded IDs.
         for (size_t i = 0; i < token_strs.size(); ++i) {
             if (token_strs[i] == "<|endoftext|>" || token_strs[i] == "<|im_end|>") {
                 logits[i] = 0.0f;
@@ -63,25 +61,23 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::v
         return;
     }
 
-    std::unordered_set<int32_t> valid_set(valid_tokens.begin(), valid_tokens.end());
+    const size_t vocab_size = logits.size();
+    std::vector<bool> valid_mask(vocab_size, false);
+    for (int32_t id : valid_tokens) valid_mask[id] = true;
 
-    // When grammar is accepting, also allow EOS — the model decides whether
-    // to end or continue with another statement naturally.
     if (grammar_->is_accepting_state()) {
-        
         for (size_t i = 0; i < token_strs.size(); ++i) {
             if (token_strs[i] == "<|endoftext|>" || token_strs[i] == "<|im_end|>") {
-                valid_set.insert(static_cast<int32_t>(i));
+                valid_mask[i] = true;
                 break;
             }
         }
-
-        valid_set.insert(eos_token_id_);
+        if (eos_token_id_ >= 0 && static_cast<size_t>(eos_token_id_) < vocab_size)
+            valid_mask[eos_token_id_] = true;
     }
-    
 
-    for (size_t i = 0; i < logits.size(); ++i) {
-        if (!valid_set.count(static_cast<int32_t>(i)))
+    for (size_t i = 0; i < vocab_size; ++i) {
+        if (!valid_mask[i])
             logits[i] = -std::numeric_limits<float>::infinity();
     }
 }

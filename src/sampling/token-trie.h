@@ -48,8 +48,23 @@ public:
     // Fast path: collect all token IDs whose string starts with char c.
     void collect_by_first_char(char c, std::vector<int32_t>& out) const;
 
+    // Mark valid tokens in a bitset directly for a char class.
+    // Much faster than collect_by_char_class + insertion loop because it
+    // uses precomputed first-char buckets (contiguous, cache-friendly).
+    void mark_char_class(const std::set<char>& chars, bool negated,
+                         std::vector<bool>& valid_mask) const;
+
+    // Total number of non-empty tokens indexed by the trie.
+    size_t token_count() const { return token_count_; }
+
 private:
     std::unique_ptr<TrieNode> root_;
+    size_t token_count_ = 0;
+
+    // Precomputed index: first_char_tokens_[c] = all token IDs whose
+    // decoded string starts with byte value c. Built once, contiguous
+    // arrays for cache-friendly iteration.
+    std::vector<int32_t> first_char_tokens_[256];
 
     // Recursively collect all token IDs in the subtree rooted at node.
     static void collect_subtree(const TrieNode* node, std::vector<int32_t>& out);

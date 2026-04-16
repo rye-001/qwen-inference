@@ -93,6 +93,17 @@ struct GrammarVocab::Impl {
                                     const Elem* pos,
                                     const std::vector<const Elem*>& conts,
                                     std::vector<GrammarState>& result);
+
+    // resolve_after_terminal: pre-resolve what grammar states follow after a
+    //   terminal (LITERAL/CHAR_CLASS) is fully consumed. This is the expensive
+    //   grammar expansion that we want to do ONCE per literal group, not per
+    //   candidate token.
+    //   Sets has_root_end=true if root-level completion is possible (accepting).
+    static void resolve_after_terminal(const Impl* impl,
+                                       const Elem* terminal_pos,
+                                       const std::vector<const Elem*>& conts,
+                                       std::vector<GrammarState>& resolved,
+                                       bool& has_root_end);
 };
 
 // ============================================================================
@@ -234,6 +245,32 @@ void GrammarVocab::Impl::resolve_and_consume(
     explore_alternatives(impl, pos, conts, terminals);
     for (const auto& ts : terminals)
         consume_token(impl, token_str, offset, ts.pos, ts.char_idx, ts.continuations, result);
+}
+
+void GrammarVocab::Impl::resolve_after_terminal(
+    const Impl* impl,
+    const Elem* terminal_pos,
+    const std::vector<const Elem*>& conts,
+    std::vector<GrammarState>& resolved,
+    bool& has_root_end)
+{
+    const Elem* next_pos = terminal_pos + 1;
+
+    if (next_pos->type == Elem::ALT || next_pos->type == Elem::END) {
+        // This alternative / rule is done
+        if (!conts.empty()) {
+            auto ret = conts.back();
+            std::vector<const Elem*> new_conts(conts.begin(), conts.end()-1);
+            explore_alternatives(impl, ret, new_conts, resolved);
+        } else {
+            // Root-level completion — accepting state when token exactly matches
+            auto rule_end = find_rule_end(terminal_pos, impl);
+            if (rule_end) has_root_end = true;
+        }
+    } else {
+        // Sequence continues
+        explore_alternatives(impl, next_pos, conts, resolved);
+    }
 }
 
 void GrammarVocab::Impl::consume_token(
@@ -532,17 +569,13 @@ bool GrammarVocab::is_accepting_state() const {
 }
 
 std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::string>& vocab) const {
-    std::set<int32_t> valid_set;
+    const size_t vocab_size = vocab.size();
+
+    std::vector<bool> valid_mask(vocab_size, false);
 
     if (trie_) {
-        // ---- Grouped trie path: deduplicate queries across active states ----
-
-        // Group LITERAL states by (literal_value_index, char_idx) so states
-        // with the same remaining prefix share a single trie walk.
-        // Key: (literal_value_index << 32) | char_idx
         std::map<uint64_t, std::vector<const Impl::GrammarState*>> literal_groups;
-        // Group CHAR_CLASS states by class index — same class = same query.
-        std::map<uint32_t, bool> cc_seen;  // class_id → already queried
+        std::map<uint32_t, bool> cc_seen;
 
         for (const auto& state : impl_->stacks) {
             if (!state.pos) continue;
@@ -556,39 +589,122 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
 
             } else if (state.pos->type == Elem::CHAR_CLASS) {
                 uint32_t cc_id = state.pos->value;
-                if (cc_seen.count(cc_id)) continue;  // already queried
+                if (cc_seen.count(cc_id)) continue;
                 cc_seen[cc_id] = true;
 
                 const auto& cc = impl_->char_classes[cc_id];
-                std::vector<int32_t> candidates;
-                trie_->collect_by_char_class(cc.first, cc.second, candidates);
-                for (int32_t tok_id : candidates)
-                    valid_set.insert(tok_id);
+                trie_->mark_char_class(cc.first, cc.second, valid_mask);
             }
         }
 
-        // Execute one trie walk per unique (literal, char_idx), then run
-        // consume_token for each state in the group on the shared candidates.
+        // LITERAL trie walk + resolve-once optimization
+        // Pre-resolve grammar states after each literal ONCE per state,
+        // then match candidates against pre-resolved terminals.
         for (const auto& [key, states] : literal_groups) {
             uint32_t lit_id   = static_cast<uint32_t>(key >> 32);
             size_t   char_idx = static_cast<size_t>(key & 0xFFFFFFFF);
             const std::string& lit = impl_->literal_values[lit_id];
+            const size_t remaining_len = lit.size() - char_idx;
 
             std::vector<int32_t> candidates;
             trie_->collect_by_prefix(lit, char_idx, candidates);
 
-            for (int32_t tok_id : candidates) {
-                // Skip if already known valid (avoid redundant consume_token)
-                if (valid_set.count(tok_id)) continue;
+            // PRE-RESOLVE: for each state, compute follow-on terminals ONCE.
+            // States share (lit_id, char_idx) but may differ in continuations.
+            struct PreResolved {
+                std::vector<Impl::GrammarState> after_terminals;
+                bool has_root_end = false;
+            };
+            std::vector<PreResolved> pre_resolved(states.size());
+            for (size_t si = 0; si < states.size(); si++) {
+                Impl::resolve_after_terminal(impl_.get(),
+                                             states[si]->pos, states[si]->continuations,
+                                             pre_resolved[si].after_terminals,
+                                             pre_resolved[si].has_root_end);
+            }
 
-                for (const auto* st : states) {
-                    std::vector<Impl::GrammarState> result;
-                    Impl::consume_token(impl_.get(), vocab[tok_id], 0,
-                                        st->pos, st->char_idx,
-                                        st->continuations, result);
-                    if (!result.empty()) {
-                        valid_set.insert(tok_id);
-                        break;  // one state accepting suffices
+            for (int32_t tok_id : candidates) {
+                if (valid_mask[tok_id]) continue;
+
+                const std::string& tok = vocab[tok_id];
+                const size_t tok_len = tok.size();
+
+                if (tok_len < remaining_len) {
+                    if (tok.compare(0, tok_len, lit, char_idx, tok_len) == 0) {
+                        valid_mask[tok_id] = true;
+                    }
+                } else if (tok_len == remaining_len) {
+                    // Exact match: token exactly consumes remaining literal.
+                    // Valid iff grammar can advance (any pre-resolved terminal exists
+                    // or root-level completion is possible).
+                    if (lit.compare(char_idx, remaining_len, tok, 0, remaining_len) != 0)
+                        continue;
+                    for (size_t si = 0; si < states.size(); si++) {
+                        if (!pre_resolved[si].after_terminals.empty() ||
+                            pre_resolved[si].has_root_end) {
+                            valid_mask[tok_id] = true;
+                            break;
+                        }
+                    }
+                } else {
+                    if (lit.compare(char_idx, remaining_len, tok, 0, remaining_len) != 0)
+                        continue;
+
+                    const size_t tok_offset = remaining_len;
+                    const size_t overshoot_len = tok_len - tok_offset;
+                    const char overshoot_char = tok[tok_offset];
+                    for (size_t si = 0; si < states.size() && !valid_mask[tok_id]; si++) {
+                        for (const auto& resolved : pre_resolved[si].after_terminals) {
+                            if (resolved.pos->type == Elem::LITERAL) {
+                                const std::string& rlit = impl_->literal_values[resolved.pos->value];
+                                const size_t rlit_remaining = rlit.size() - resolved.char_idx;
+
+                                // First-char filter
+                                if (rlit[resolved.char_idx] != overshoot_char)
+                                    continue;
+
+                                // Inline char comparison: avoid consume_token
+                                // for partial and exact matches of this resolved literal.
+                                const size_t to_match = std::min(overshoot_len, rlit_remaining);
+                                if (tok.compare(tok_offset, to_match, rlit, resolved.char_idx, to_match) != 0)
+                                    continue;
+
+                                if (overshoot_len <= rlit_remaining) {
+                                    // Partial or exact match of resolved literal.
+                                    // Partial: always valid (grammar continues next token).
+                                    // Exact: valid iff grammar can advance past this literal.
+                                    // For exact, we'd need another resolve — but in practice,
+                                    // the grammar always has a next element (sequence continues
+                                    // or rule returns). Only invalid if grammar is truly done
+                                    // and token outlives it. Use consume_token only for exact.
+                                    if (overshoot_len < rlit_remaining) {
+                                        valid_mask[tok_id] = true;
+                                        break;
+                                    }
+                                    // Fall through to consume_token for exact match
+                                }
+                                // Exact or deeper overshoot: need consume_token
+                            } else if (resolved.pos->type == Elem::CHAR_CLASS) {
+                                const auto& cc = impl_->char_classes[resolved.pos->value];
+                                const bool in_set  = cc.first.count(overshoot_char) > 0;
+                                const bool allowed = cc.second ? !in_set : in_set;
+                                if (!allowed) continue;
+                                // CHAR_CLASS matches 1 char. If overshoot_len == 1,
+                                // the token is consumed. Valid iff grammar can advance.
+                                // Fall through to consume_token.
+                            } else {
+                                continue; // END state — can't consume more chars
+                            }
+
+                            std::vector<Impl::GrammarState> result;
+                            Impl::consume_token(impl_.get(), tok, tok_offset,
+                                                resolved.pos, resolved.char_idx,
+                                                resolved.continuations, result);
+                            if (!result.empty()) {
+                                valid_mask[tok_id] = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -604,7 +720,8 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
                 if (state.char_idx >= lit.size()) continue;
                 const char expected_first = lit[state.char_idx];
 
-                for (size_t i = 0; i < vocab.size(); ++i) {
+                for (size_t i = 0; i < vocab_size; ++i) {
+                    if (valid_mask[i]) continue;
                     if (vocab[i].empty()) continue;
                     if (vocab[i][0] != expected_first) continue;
 
@@ -613,23 +730,28 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
                                         state.pos, state.char_idx,
                                         state.continuations, result);
                     if (!result.empty())
-                        valid_set.insert(static_cast<int32_t>(i));
+                        valid_mask[i] = true;
                 }
 
             } else if (state.pos->type == Elem::CHAR_CLASS) {
                 const auto& cc = impl_->char_classes[state.pos->value];
-                for (size_t i = 0; i < vocab.size(); ++i) {
+                for (size_t i = 0; i < vocab_size; ++i) {
+                    if (valid_mask[i]) continue;
                     if (vocab[i].empty()) continue;
-                    const char fc = vocab[i][0];
-                    const bool in_set  = cc.first.count(fc) > 0;
+                    const bool in_set  = cc.first.count(vocab[i][0]) > 0;
                     const bool allowed = cc.second ? !in_set : in_set;
-                    if (allowed) valid_set.insert(static_cast<int32_t>(i));
+                    if (allowed) valid_mask[i] = true;
                 }
             }
         }
     }
 
-    return {valid_set.begin(), valid_set.end()};
+    // Collect valid IDs from bitset
+    std::vector<int32_t> result;
+    for (size_t i = 0; i < vocab_size; ++i) {
+        if (valid_mask[i]) result.push_back(static_cast<int32_t>(i));
+    }
+    return result;
 }
 
 void GrammarVocab::accept_token(int32_t token_id, const std::vector<std::string>& vocab) {
