@@ -5,7 +5,7 @@
 #include <memory>
 
 #include "qwen3-model.h"
-#include "../kv-cache/simple-kv-cache.h"
+#include "../state/kv_cache_simple.h"
 #include "ggml-backend.h"
 
 struct ggml_context;
@@ -143,14 +143,6 @@ protected:
         ggml_tensor* cur,
         ggml_tensor* mw,
         int il) const;
-
-    ggml_tensor* ffn_swiglu(
-        ggml_cgraph* gf,
-        ggml_tensor* cur,
-        ggml_tensor* gate,
-        ggml_tensor* up,
-        ggml_tensor* down,
-        int il);
 
     // Core multi-head attention: Q @ K^T → softmax → @ V
     // Handles GQA, permutations, stream splitting, and recombination.

@@ -5,7 +5,7 @@
 // RED baseline: turboquant.h/cpp do not exist yet — tests fail to link.
 // GREEN target: all tests pass after implementation.
 
-#include "turboquant.h"
+#include "../../src/state/turboquant.h"
 #include <gtest/gtest.h>
 #include <vector>
 #include <cmath>

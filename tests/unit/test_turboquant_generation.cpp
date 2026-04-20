@@ -21,9 +21,10 @@
 #include <string>
 #include <vector>
 
-#include "../../src/qwen3-core/forward-pass-factory.h"
+#include "../../src/models/qwen3.h"
+#include "../../src/models/qwen35.h"
 #include "../../src/qwen3-core/qwen3-model.h"
-#include "../../src/qwen3-core/tokenizer.h"
+#include "../../src/loader/tokenizer.h"
 #include "../../src/sampling/sampling.h"
 
 // ---------------------------------------------------------------------------
@@ -70,7 +71,7 @@ protected:
                                          int max_tokens = 20) {
         const auto& meta = model_->get_metadata();
         // Fresh forward pass for each call — no shared state between bits=0 / bits=4 runs.
-        auto fp   = create_forward_pass(*model_, &meta, 2048, /*max_batch=*/1, kv_quant_bits);
+        auto fp   = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, /*max_batch=*/1, kv_quant_bits);
         auto* sched = model_->get_scheduler();
         auto* tok   = model_->get_tokenizer();
         qwen3::GreedySampler sampler;

@@ -24,6 +24,7 @@ add_executable(qwen3-unit-tests
 # Link libraries for unit tests
 target_link_libraries(qwen3-unit-tests PRIVATE
     GTest::gtest_main
+    qinf-models
     qwen3-core
     sampling
     ggml
@@ -41,6 +42,7 @@ add_executable(qwen3-integration-tests
 # Link libraries for integration tests
 target_link_libraries(qwen3-integration-tests PRIVATE
     GTest::gtest_main
+    qinf-models
     qwen3-core
     sampling
     ggml
@@ -56,6 +58,7 @@ add_executable(qwen3-order-mngmt-test
 
 # Link libraries
 target_link_libraries(qwen3-order-mngmt-test PRIVATE
+    qinf-models
     qwen3-core
     sampling
     ggml
@@ -68,6 +71,7 @@ add_executable(qwen3-parallel-order-mngmt-test
 
 # Link libraries
 target_link_libraries(qwen3-parallel-order-mngmt-test PRIVATE
+    qinf-models
     qwen3-core
     sampling
     ggml
@@ -80,7 +84,7 @@ add_executable(qwen3-turboquant-tests
 
 target_link_libraries(qwen3-turboquant-tests PRIVATE
     GTest::gtest_main
-    qwen3-kv-cache
+    qinf-state
 )
 
 gtest_discover_tests(qwen3-turboquant-tests)
@@ -92,7 +96,7 @@ add_executable(qwen3-compressed-kv-tests
 
 target_link_libraries(qwen3-compressed-kv-tests PRIVATE
     GTest::gtest_main
-    qwen3-kv-cache
+    qinf-state
 )
 
 gtest_discover_tests(qwen3-compressed-kv-tests)
@@ -115,7 +119,7 @@ add_executable(qwen3-snapkv-eviction-tests
 
 target_link_libraries(qwen3-snapkv-eviction-tests PRIVATE
     GTest::gtest_main
-    qwen3-kv-cache
+    qinf-state
     ggml
 )
 
@@ -128,7 +132,7 @@ add_executable(qwen3-snapkv-position-tests
 
 target_link_libraries(qwen3-snapkv-position-tests PRIVATE
     GTest::gtest_main
-    qwen3-kv-cache
+    qinf-state
     qwen3-core
     ggml
 )
@@ -153,6 +157,7 @@ add_executable(qwen3-parallel-grammar-test
 )
 
 target_link_libraries(qwen3-parallel-grammar-test PRIVATE
+    qinf-models
     qwen3-core
     sampling
     ggml

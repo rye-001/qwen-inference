@@ -11,8 +11,9 @@
 #include <iostream>
 
 #include "../../src/qwen3-core/qwen3-model.h"
-#include "../../src/qwen3-core/forward-pass-factory.h"
-#include "../../src/qwen3-core/tokenizer.h"
+#include "../../src/models/qwen3.h"
+#include "../../src/models/qwen35.h"
+#include "../../src/loader/tokenizer.h"
 #include "../../src/sampling/sampling.h"
 
 static std::string get_qwen35_model_path() {
@@ -35,7 +36,7 @@ protected:
 
     std::string generate(const std::string& prompt, int max_tokens = 20) {
         const auto& meta = model_->get_metadata();
-        auto fp = create_forward_pass(*model_, &meta, 2048, 1);
+        auto fp = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, 1);
         ggml_backend_sched_t sched = model_->get_scheduler();
         Tokenizer* tok = model_->get_tokenizer();
         qwen3::GreedySampler sampler;
@@ -128,7 +129,7 @@ TEST_F(Qwen35GenerationTest, SequentialGenerations) {
 TEST_F(Qwen35GenerationTest, LogitsStayFinite) {
     SKIP_IF_NO_MODEL();
     const auto& meta = model_->get_metadata();
-    auto fp = create_forward_pass(*model_, &meta, 2048, 1);
+    auto fp = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, 1);
     ggml_backend_sched_t sched = model_->get_scheduler();
     Tokenizer* tok = model_->get_tokenizer();
     qwen3::GreedySampler sampler;

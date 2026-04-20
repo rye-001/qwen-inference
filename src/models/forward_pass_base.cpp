@@ -1,4 +1,6 @@
-#include "forward-pass-base.h"
+#include "forward_pass_base.h"
+#include "../layers/attention.h"
+#include "../layers/ffn.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -80,28 +82,9 @@ ggml_tensor* ForwardPassBase::build_norm(
     return cur;
 }
 
-ggml_tensor* ForwardPassBase::ffn_swiglu(
-    ggml_cgraph* gf,
-    ggml_tensor* cur,
-    ggml_tensor* gate,
-    ggml_tensor* up,
-    ggml_tensor* down,
-    int il)
-{
-    ggml_tensor * tmp = ggml_mul_mat(ctx_, up, cur);
-    set_tensor_name(gf, tmp, "ffn_up", il);
-    cur = ggml_mul_mat(ctx_, gate, cur);
-    set_tensor_name(gf, cur, "ffn_gate", il);
-    cur = ggml_swiglu_split(ctx_, cur, tmp);
-    set_tensor_name(gf, cur, "ffn_swiglu", il);
-    cur = ggml_mul_mat(ctx_, down, cur);
-    return cur;
-}
-
-// ============================================================
-// build_attn_mha
-// Source: Qwen3ForwardPass::_build_attn_mha
-// ============================================================
+// Thin wrapper — implementation lives in src/layers/attention.cpp.
+// qwen35.cpp calls this via the base class; all new code
+// should call the free function ::build_attn_mha directly.
 ggml_tensor* ForwardPassBase::build_attn_mha(
     ggml_cgraph* gf,
     ggml_tensor* q,
@@ -113,54 +96,7 @@ ggml_tensor* ForwardPassBase::build_attn_mha(
     uint32_t pos,
     int il) const
 {
-    // TODO: move from Qwen3ForwardPass::_build_attn_mha
-    // reshape_4d, permute Q/K/V, mul_mat, soft_max_ext, mul_mat, permute, cont_2d
-    const bool v_trans = v->nb[1] > v->nb[2];
-
-    // split the batch into streams if needed
-    const auto n_stream = k->ne[3];
-
-    q = ggml_reshape_4d(ctx_, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream);
-    set_tensor_name(gf, q, "q_reshaped", il);
-
-    q = ggml_permute(ctx_, q, 0, 2, 1, 3);
-    set_tensor_name(gf, q, "q_permuted", il);
-    k = ggml_permute(ctx_, k, 0, 2, 1, 3);
-    set_tensor_name(gf, k, "k_permuted", il);
-    v = ggml_permute(ctx_, v, 1, 2, 0, 3);
-    set_tensor_name(gf, v, "v_permuted", il);
-    v = ggml_cont(ctx_, v);
-    set_tensor_name(gf, v, "v_cont", il);
-
-    const auto n_kv = k->ne[1];
-
-    ggml_tensor * cur;
-
-    {
-        ggml_tensor * kq = ggml_mul_mat(ctx_, k, q);
-        set_tensor_name(gf, kq, "kq", il);
-
-        // note: this op tends to require high floating point range
-        //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-
-        kq = ggml_soft_max_ext(ctx_, kq, kq_mask, kq_scale, 0/*hparams.f_max_alibi_bias*/);
-        set_tensor_name(gf, kq, "kq_soft", il);
-
-        ggml_soft_max_add_sinks(kq, sinks);
-
-        ggml_tensor * kqv = ggml_mul_mat(ctx_, v, kq);
-        set_tensor_name(gf, kqv, "kqv", il);
-
-        cur = ggml_permute(ctx_, kqv, 0, 2, 1, 3);
-        set_tensor_name(gf, cur, "kqv_permuted", il);
-
-        // recombine streams
-        cur = ggml_cont_2d(ctx_, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
-        set_tensor_name(gf, cur, "attn_recombined", il);    
-    }
-
-    return cur;
+    return ::build_attn_mha(ctx_, gf, q, k, v, kq_mask, sinks, kq_scale, pos, il);
 }
 
 void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur) {

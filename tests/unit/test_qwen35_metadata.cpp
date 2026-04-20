@@ -16,7 +16,7 @@
 #include <set>
 
 #include "../../src/qwen3-core/qwen3-model.h"
-#include "../../src/qwen3-core/gguf-loader.h"
+#include "../../src/loader/gguf_loader.h"
 
 // Helper to get model path from env
 static std::string get_qwen35_model_path() {

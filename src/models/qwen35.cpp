@@ -1,5 +1,7 @@
-#include "forward-pass-qwen35.h"
-#include "../kv-cache/snapkv-eviction.h"
+#include "qwen35.h"
+#include "../layers/attention.h"
+#include "../layers/ffn.h"
+#include "../state/snapkv.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -164,7 +166,7 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
         set_tensor_name(gf, cur, "post_attn_norm", il);
 
         // FFN
-        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
+        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
                          block.ffn_down_weight, il);
         set_tensor_name(gf, cur, "ffn_out", il);
 
@@ -181,9 +183,11 @@ struct ggml_cgraph* Qwen35ForwardPass::build_prefill_graph(
 }
 
 // ============================================================
-// build_attention_layer — joint Q+Gate, gated attention, partial RoPE
+// build_attention_layer — thin wrapper around ::build_qwen35_attention
 // ============================================================
 
+// Implementation lives in src/layers/attention.cpp.
+// All new code should call the free function ::build_qwen35_attention directly.
 ggml_tensor* Qwen35ForwardPass::build_attention_layer(
     ggml_cgraph* gf,
     simple_kv_cache* kv_cache,
@@ -194,92 +198,22 @@ ggml_tensor* Qwen35ForwardPass::build_attention_layer(
     uint32_t slot_idx,
     int il)
 {
-    const int n_embd_head = meta_.attention_key_length;
-    const int n_head      = meta_.attention_head_count;
-    const int n_head_kv   = meta_.attention_head_count_kv;
     auto& block = model_.get_block(il);
-
+    const int n_embd_head = meta_.attention_key_length;
     const int n_rot = (meta_.rope_dimension_count > 0)
         ? meta_.rope_dimension_count : n_embd_head;
-
-    // A. Joint Q+Gate projection
-    ggml_tensor* Qcur_full = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
-    set_tensor_name(gf, Qcur_full, "Qcur_full", il);
-
-    // B. Extract Q via strided view
-    ggml_tensor* Qcur = ggml_view_3d(ctx_, Qcur_full,
-        n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
-    set_tensor_name(gf, Qcur, "Qcur", il);
-
-    Qcur = build_norm(gf, Qcur, block.attn_q_norm_weight, il);
-    set_tensor_name(gf, Qcur, "Qcur_normed", il);
-
-    // C. K and V projections
-    ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
-    ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
-
-    Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_tokens);
-
-    Kcur = build_norm(gf, Kcur, block.attn_k_norm_weight, il);
-    set_tensor_name(gf, Kcur, "Kcur_normed", il);
-
-    // D. Extract Gate
-    ggml_tensor* gate = ggml_view_3d(ctx_, Qcur_full,
-        n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx_, gate, n_embd_head * n_head, n_tokens);
-    set_tensor_name(gf, gate, "gate", il);
-
-    // E. RoPE
-    const float freq_base = meta_.rope_freq_base;
-    Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr,
-                          n_rot, GGML_ROPE_TYPE_NEOX,
-                          meta_.context_length, freq_base,
-                          1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-    Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr,
-                          n_rot, GGML_ROPE_TYPE_NEOX,
-                          meta_.context_length, freq_base,
-                          1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-
-    // F. KV cache + attention
-    const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
-    const uint32_t cache_pos = kv_cache->get_pos(slot_idx);
-    const uint32_t n_kv = cache_pos + n_tokens;
-
-    ggml_build_forward_expand(gf, kv_cache->cpy_k(ctx_, Kcur, kv_cache_layer, slot_idx));
-    ggml_build_forward_expand(gf, kv_cache->cpy_v(ctx_, Vcur, kv_cache_layer, slot_idx));
-
-    ggml_tensor* k_full = kv_cache->get_k(ctx_, kv_cache_layer, n_kv, slot_idx);
-    ggml_tensor* v_full = kv_cache->get_v(ctx_, kv_cache_layer, n_kv, slot_idx);
-
-    const int n_embd_kv = n_head_kv * n_embd_head;
-    ggml_tensor* k_view = ggml_view_3d(ctx_, k_full,
-        n_embd_head, n_head_kv, n_kv,
-        n_embd_head * sizeof(float), n_embd_kv * sizeof(float), 0);
-    ggml_tensor* v_view = ggml_view_3d(ctx_, v_full,
-        n_embd_head, n_head_kv, n_kv,
-        n_embd_head * sizeof(float), n_embd_kv * sizeof(float), 0);
-
-    ggml_tensor* kq_mask = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, n_kv, n_tokens);
-    set_tensor_name(gf, kq_mask, "kq_mask", il);
-    ggml_build_forward_expand(gf, kq_mask);
-
-    cur = build_attn_mha(gf, Qcur, k_view, v_view, kq_mask, nullptr, kq_scale, cache_pos, il);
-
-    // G. Gate sigmoid
-    cur = ggml_mul(ctx_, cur, ggml_sigmoid(ctx_, gate));
-    set_tensor_name(gf, cur, "attn_gated", il);
-
-    // H. Output projection
-    cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
-    set_tensor_name(gf, cur, "attn_output", il);
-
-    return cur;
+    return ::build_qwen35_attention(
+        ctx_, gf, kv_cache, cur, inp_pos, kv_cache_layer, n_tokens, slot_idx, il,
+        block.attn_q_weight, block.attn_q_norm_weight,
+        block.attn_k_weight, block.attn_k_norm_weight,
+        block.attn_v_weight, block.attn_output_weight,
+        n_embd_head,
+        meta_.attention_head_count,
+        meta_.attention_head_count_kv,
+        n_rot,
+        meta_.rope_freq_base,
+        static_cast<int>(meta_.context_length),
+        meta_.rms_norm_eps);
 }
 
 // ============================================================
@@ -552,7 +486,7 @@ ggml_cgraph* Qwen35ForwardPass::_build_qwen35_layer_graph(
     cur = ggml_add(ctx_, cur, inpSA);
     ggml_tensor* ffn_residual = cur;
     cur = build_norm(gf, cur, block.ffn_norm_weight, il);
-    cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
+    cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
                      block.ffn_down_weight, il);
     cur = ggml_add(ctx_, cur, ffn_residual);
 
@@ -601,7 +535,7 @@ ggml_cgraph* Qwen35ForwardPass::_build_qwen35_batch_graph(
         cur = ggml_add(ctx_, cur, inpSA);
         ggml_tensor* ffn_residual = cur;
         cur = build_norm(gf, cur, block.ffn_norm_weight, il);
-        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
+        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
                          block.ffn_down_weight, il);
         cur = ggml_add(ctx_, cur, ffn_residual);
     }
@@ -1077,7 +1011,7 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
 
         // Post-attention norm + FFN + residual
         cur = build_norm(gf, cur, block.ffn_norm_weight, il);
-        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight,
+        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight,
                          block.ffn_up_weight, block.ffn_down_weight, il);
         cur = ggml_add(ctx_, cur, ffn_residual);
 
@@ -1307,123 +1241,39 @@ ggml_tensor* Qwen35ForwardPass::build_batched_ssm_layer(
 }
 
 // ============================================================
-// build_batched_attention_layer — Qwen35 attention for multi-slot decode
-//
-// Joint Q+Gate projection, Q/K norms, partial RoPE, sigmoid gating.
-// KV cache: per-slot write, gathered read, shared mask.
+// build_batched_attention_layer — thin wrapper around ::build_qwen35_batched_attention
 // ============================================================
 
+// Implementation lives in src/layers/attention.cpp.
+// All new code should call the free function ::build_qwen35_batched_attention directly.
 ggml_tensor* Qwen35ForwardPass::build_batched_attention_layer(
     ggml_cgraph* gf,
-    ggml_tensor* cur,            // [n_embd, n_batch]
-    ggml_tensor* inp_pos,        // [n_batch]
-    ggml_tensor* kq_mask,        // [n_kv_len, 1, 1, n_batch]
-    ggml_tensor* gather_indices, // [n_batch * n_kv_len]
+    ggml_tensor* cur,
+    ggml_tensor* inp_pos,
+    ggml_tensor* kq_mask,
+    ggml_tensor* gather_indices,
     int kv_cache_layer,
     const std::vector<uint32_t>& slots,
     const std::vector<int32_t>& positions,
     int il)
 {
-    const int n_embd_head = meta_.attention_key_length;
-    const int n_head      = meta_.attention_head_count;
-    const int n_head_kv   = meta_.attention_head_count_kv;
-    const size_t n_batch  = slots.size();
     auto& block = model_.get_block(il);
-
+    const int n_embd_head = meta_.attention_key_length;
     const int n_rot = (meta_.rope_dimension_count > 0)
         ? meta_.rope_dimension_count : n_embd_head;
-
-    // A. Joint Q+Gate projection → [(n_embd_head*2)*n_head, n_batch]
-    ggml_tensor* Qcur_full = ggml_mul_mat(ctx_, block.attn_q_weight, cur);
-
-    // B. Extract Q via strided view → [n_embd_head, n_head, n_batch]
-    ggml_tensor* Qcur = ggml_view_3d(ctx_, Qcur_full,
-        n_embd_head, n_head, n_batch,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
-
-    Qcur = build_norm(gf, Qcur, block.attn_q_norm_weight, il);
-
-    // C. K and V projections
-    ggml_tensor* Kcur = ggml_mul_mat(ctx_, block.attn_k_weight, cur);
-    ggml_tensor* Vcur = ggml_mul_mat(ctx_, block.attn_v_weight, cur);
-
-    Kcur = ggml_reshape_3d(ctx_, Kcur, n_embd_head, n_head_kv, n_batch);
-    Vcur = ggml_reshape_3d(ctx_, Vcur, n_embd_head, n_head_kv, n_batch);
-
-    Kcur = build_norm(gf, Kcur, block.attn_k_norm_weight, il);
-
-    // D. Extract Gate → [n_embd_head*n_head, n_batch]
-    ggml_tensor* gate = ggml_view_3d(ctx_, Qcur_full,
-        n_embd_head, n_head, n_batch,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx_, gate, n_embd_head * n_head, n_batch);
-
-    // E. RoPE
-    const float freq_base = meta_.rope_freq_base;
-    Qcur = ggml_rope_ext(ctx_, Qcur, inp_pos, nullptr,
-        n_rot, GGML_ROPE_TYPE_NEOX,
-        meta_.context_length, freq_base,
-        1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-    Kcur = ggml_rope_ext(ctx_, Kcur, inp_pos, nullptr,
-        n_rot, GGML_ROPE_TYPE_NEOX,
-        meta_.context_length, freq_base,
-        1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-
-    // F. Per-slot KV cache write
-    const int n_embd_k = n_head_kv * n_embd_head;
-    const int n_embd_v = n_head_kv * n_embd_head;
-
-    ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx_, Kcur, n_embd_k, 1, n_batch);
-    ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx_, Vcur, n_embd_v, 1, n_batch);
-
-    for (size_t b = 0; b < n_batch; ++b) {
-        ggml_tensor* k_slice = ggml_view_2d(ctx_, k_storage_fmt,
-            n_embd_k, 1, k_storage_fmt->nb[1], b * k_storage_fmt->nb[2]);
-        ggml_tensor* v_slice = ggml_view_2d(ctx_, v_storage_fmt,
-            n_embd_v, 1, v_storage_fmt->nb[1], b * v_storage_fmt->nb[2]);
-
-        ggml_build_forward_expand(gf, kv_cache_->cpy_k(ctx_, k_slice, kv_cache_layer, slots[b]));
-        ggml_build_forward_expand(gf, kv_cache_->cpy_v(ctx_, v_slice, kv_cache_layer, slots[b]));
-    }
-
-    // G. Gather KV for all slots
-    uint32_t max_pos = 0;
-    for (int32_t p : positions) {
-        if (p > (int32_t)max_pos) max_pos = (uint32_t)p;
-    }
-    uint32_t n_kv_len = max_pos + 1;
-
-    ggml_tensor* k_gathered = kv_cache_->gather_k(ctx_, gf, kv_cache_layer,
-        gather_indices, n_batch, n_kv_len);
-    ggml_tensor* v_gathered = kv_cache_->gather_v(ctx_, gf, kv_cache_layer,
-        gather_indices, n_batch, n_kv_len);
-
-    // Reshape to 4D: [n_embd_head, n_head_kv, n_kv_len, n_batch]
-    ggml_tensor* k_view = ggml_view_4d(ctx_, k_gathered,
-        n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_k * sizeof(float),
-        n_embd_k * n_kv_len * sizeof(float), 0);
-    ggml_tensor* v_view = ggml_view_4d(ctx_, v_gathered,
-        n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_v * sizeof(float),
-        n_embd_v * n_kv_len * sizeof(float), 0);
-
-    // H. Attention
-    const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
-    cur = build_attn_mha(gf, Qcur, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
-
-    // I. Gate sigmoid
-    cur = ggml_mul(ctx_, cur, ggml_sigmoid(ctx_, gate));
-
-    // J. Output projection
-    cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
-
-    return cur;
+    return ::build_qwen35_batched_attention(
+        ctx_, gf, kv_cache_.get(), cur, inp_pos, kq_mask, gather_indices,
+        kv_cache_layer, slots, positions, il,
+        block.attn_q_weight, block.attn_q_norm_weight,
+        block.attn_k_weight, block.attn_k_norm_weight,
+        block.attn_v_weight, block.attn_output_weight,
+        n_embd_head,
+        meta_.attention_head_count,
+        meta_.attention_head_count_kv,
+        n_rot,
+        meta_.rope_freq_base,
+        static_cast<int>(meta_.context_length),
+        meta_.rms_norm_eps);
 }
 
 // ============================================================

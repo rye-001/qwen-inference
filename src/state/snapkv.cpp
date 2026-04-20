@@ -1,6 +1,6 @@
-#include "snapkv-eviction.h"
-#include "simple-kv-cache.h"
-#include "compressed_kv_store.h"
+#include "snapkv.h"
+#include "kv_cache_simple.h"
+#include "kv_cache_compressed.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"

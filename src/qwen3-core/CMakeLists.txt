@@ -1,22 +1,24 @@
 # Qwen-3 Core Engine Library
 add_library(qwen3-core STATIC
     qwen3-model.cpp
-    gguf-loader.cpp
-    forward-pass-base.cpp
-    forward-pass.cpp
-    forward-pass-qwen35.cpp
-    forward-pass-factory.cpp
-    tokenizer.cpp
+    ../loader/gguf_loader.cpp
+    ../loader/tokenizer.cpp
 )
 
+# Expose src/loader/ so consumers can use #include "loader/gguf_loader.h" etc.
+# (The global include_directories(src/) in the root CMakeLists already covers
+# this for most targets; the PUBLIC entry here ensures qwen3-core's own
+# dependents inherit it without relying on the global setting.)
 target_include_directories(qwen3-core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src/loader
     $<TARGET_PROPERTY:ggml,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
 target_link_libraries(qwen3-core PUBLIC
     ggml
-    qwen3-kv-cache
+    qinf-layers
+    qinf-state
 )
 
 # Enable position-independent code for static library

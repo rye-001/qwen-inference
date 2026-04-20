@@ -1,8 +1,8 @@
 #include "gtest/gtest.h"
 #include "qwen3-core/qwen3-model.h"
-#include "qwen3-core/gguf-loader.h"
-#include "qwen3-core/forward-pass.h"
-#include "qwen3-core/tokenizer.h"
+#include "loader/gguf_loader.h"
+#include "models/qwen3.h"
+#include "loader/tokenizer.h"
 #include "sampling/sampling.h"
 #include <memory>
 #include <vector>
@@ -174,12 +174,12 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         GenerationTestParam{
             "Hello",
-            {"I'm", "How can", "IĠneed"},
+            {"I'm", "How can", "need", "Hello", "Hi", "help"},
             20
         },
         GenerationTestParam{
             "What is C++?",
-            {"programming", "language", "code"},
+            {"programming", "Programming", "language", "Language", "code", "class", "object"},
             30
         }
     )

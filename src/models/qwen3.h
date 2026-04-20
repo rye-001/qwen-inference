@@ -1,8 +1,8 @@
 #pragma once
 
-#include "forward-pass-base.h"
-#include "../kv-cache/simple-kv-cache.h"
-#include "../kv-cache/compressed_kv_store.h"
+#include "forward_pass_base.h"
+#include "../state/kv_cache_simple.h"
+#include "../state/kv_cache_compressed.h"
 
 /**
  * Forward pass for Qwen2 and Qwen3 architectures.
@@ -99,13 +99,7 @@ private:
     std::vector<float> rope_cos_cached_;
     std::vector<float> rope_sin_cached_;
 
-    // --- Qwen2/3-specific attention builders ---
-    ggml_tensor* _build_attention_layer(
-        ggml_cgraph* gf,
-        simple_kv_cache* kv_cache,
-        ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
-        int layer_idx, float kq_scale,
-        uint32_t n_tokens, uint32_t slot_idx, int il);
+    // Attention subgraph construction is in src/layers/attention.cpp.
 
     // ── Per-layer / batched graph builders (TurboQuant Phase 2) ───
     // Single-layer builder — kept for reference; run_prefill uses the batch variant.
@@ -145,13 +139,4 @@ private:
             if (slot_idx < per_slot.size()) per_slot[slot_idx] = 0;
     }
 
-    ggml_tensor* _build_batched_attention_layer(
-        ggml_cgraph* gf,
-        simple_kv_cache* kv_cache,
-        ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
-        int layer_idx, float kq_scale,
-        const std::vector<uint32_t>& slots,
-        const std::vector<int32_t>& positions,
-        ggml_tensor* kq_mask,
-        ggml_tensor* gather_indices, int il);
 };

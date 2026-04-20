@@ -15,8 +15,8 @@
 #include <set>
 
 #include "../../src/qwen3-core/qwen3-model.h"
-#include "../../src/qwen3-core/forward-pass-qwen35.h"
-#include "../../src/kv-cache/ssm-state-cache.h"
+#include "../../src/models/qwen35.h"
+#include "../../src/state/ssm_state_cache.h"
 
 static std::string get_qwen35_model_path() {
     const char* path = std::getenv("QWEN35_MODEL_PATH");

@@ -12,8 +12,9 @@
 #include "speculative-bridge.h"
 
 #include "../qwen3-core/qwen3-model.h"
-#include "../qwen3-core/forward-pass-factory.h"
-#include "../qwen3-core/tokenizer.h"
+#include "../models/qwen3.h"
+#include "../models/qwen35.h"
+#include "../loader/tokenizer.h"
 #include "../sampling/sampling.h"
 #include "../sampling/grammar_vocab.h"
 #include "../sampling/speculative.h"

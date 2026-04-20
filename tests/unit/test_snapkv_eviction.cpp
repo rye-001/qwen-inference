@@ -8,9 +8,9 @@
 #include <gtest/gtest.h>
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "../../src/kv-cache/snapkv-eviction.h"
-#include "../../src/kv-cache/compressed_kv_store.h"
-#include "../../src/kv-cache/simple-kv-cache.h"
+#include "../../src/state/snapkv.h"
+#include "../../src/state/kv_cache_compressed.h"
+#include "../../src/state/kv_cache_simple.h"
 #include <vector>
 #include <algorithm>
 #include <numeric>

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "qwen3-model.h"
+#include "../qwen3-core/qwen3-model.h"
 #include "ggml.h"
-#include "platform.h"
+#include "../qwen3-core/platform.h"
 #include <string>
 #include <memory>
 #include <cstddef>

@@ -6,8 +6,8 @@
 #include <gtest/gtest.h>
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "../../src/kv-cache/simple-kv-cache.h"
-#include "../../src/qwen3-core/forward-pass-base.h"
+#include "../../src/state/kv_cache_simple.h"
+#include "../../src/models/forward_pass_base.h"
 
 // ============================================================================
 // 1. snapkv_seq_pos: default is 0 (inactive)
