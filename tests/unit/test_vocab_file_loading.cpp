@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "qwen3-core/gguf-loader.h"
+#include "loader/gguf_loader.h"
 #include <fstream>
 #include <vector>
 #include <unordered_map>

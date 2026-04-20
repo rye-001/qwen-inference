@@ -4,7 +4,7 @@
 #include <cstdint>
 
 #include "ggml-backend.h"
-#include "../qwen3-core/forward-pass-base.h"
+#include "../models/forward_pass_base.h"
 #include "../sampling/speculative.h"
 
 struct SpeculativeBridge {

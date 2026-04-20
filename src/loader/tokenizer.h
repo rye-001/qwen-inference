@@ -1,6 +1,6 @@
 #pragma once
 
-#include "qwen3-model.h"
+#include "../qwen3-core/qwen3-model.h"
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>

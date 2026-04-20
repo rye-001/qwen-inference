@@ -1,6 +1,8 @@
-#include "forward-pass.h"
-#include "../kv-cache/turboquant.h"
-#include "../kv-cache/snapkv-eviction.h"
+#include "qwen3.h"
+#include "../layers/attention.h"
+#include "../layers/ffn.h"
+#include "../state/turboquant.h"
+#include "../state/snapkv.h"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -209,7 +211,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
 
         // D. Grouped-Query Attention
         float kq_scale = 1.0f/sqrtf(float(n_embd_head));
-        cur = _build_attention_layer(gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, n_tokens, slot_idx, il);
+        cur = build_attention(ctx_, gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, n_tokens, slot_idx, il, n_embd_head, n_head_kv);
 
         cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
         set_tensor_name(gf, cur, "attn_output", il);
@@ -231,7 +233,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_prefill_graph(const std::vector<int3
         set_tensor_name(gf, cur, "ffn_norm", il);
 
         // G. Feed-Forward Network (SwiGLU)
-        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
+        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
         set_tensor_name(gf, cur, "ffn_output", il);
 
         // H. Residual connection after FFN
@@ -355,7 +357,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 
         // D. Attention (Batched)
         float kq_scale = 1.0f/sqrtf(float(n_embd_head));
-        cur = _build_batched_attention_layer(gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, kq_mask, gather_indices, il);
+        cur = build_batched_attention(ctx_, gf, kv_cache_.get(), Qcur, Kcur, Vcur, il, kq_scale, slots, positions, kq_mask, gather_indices, il);
 
         // E. Output Projection & Residual
         cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
@@ -363,7 +365,7 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
 
         // F. FFN
         cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
+        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight, block.ffn_down_weight, il);
         
         // H. FFN Residual
         cur = ggml_add(ctx_, cur, ffn_inp);
@@ -384,174 +386,9 @@ struct ggml_cgraph* Qwen3ForwardPass::build_decoding_graph(
     return gf;
 }
 
-ggml_tensor * Qwen3ForwardPass::_build_batched_attention_layer(
-    ggml_cgraph * gf,
-    simple_kv_cache * kv_cache,
-    ggml_tensor * q, 
-    ggml_tensor * k, 
-    ggml_tensor * v,
-    int layer_idx, 
-    float kq_scale,
-    const std::vector<uint32_t>& slots,
-    const std::vector<int32_t>& positions,
-    ggml_tensor * kq_mask,
-    ggml_tensor * gather_indices,
-    int il) {
-
-    // Assumptions for Phase 3 Step 1 (Uniform Decoding):
-    // - Each slot contributes exactly 1 token.
-    // - 'positions' contains the sequence position for that 1 token for each slot.
-    // - 'n_tokens' (batch size) = slots.size()
-    
-    size_t n_batch = slots.size();
-    
-    // 1. Update KV Cache (Write Step)
-    // We iterate through each slot in the batch and write its new K/V to storage.
-    // k and v input tensors are [n_embd, 1, n_batch] conceptually, but likely reshaped.
-    // k is [n_embd_head, n_head_kv, n_batch] from caller.
-    
-    // We need to reshape k/v back to [n_embd_k, n_batch] to slice them for storage copy
-    int n_embd_head = k->ne[0];
-    int n_head_kv   = k->ne[1];
-    int n_embd_k    = n_embd_head * n_head_kv;
-    int n_embd_v    = n_embd_head * n_head_kv;
-    
-    ggml_tensor* k_storage_fmt = ggml_reshape_3d(ctx_, k, n_embd_k, 1, n_batch);
-    ggml_tensor* v_storage_fmt = ggml_reshape_3d(ctx_, v, n_embd_v, 1, n_batch);
-
-    for (size_t i = 0; i < n_batch; ++i) {
-        // Slice the current batch item
-        // k_slice: [n_embd_k, 1]
-        size_t k_offset = i * k_storage_fmt->nb[2];
-        ggml_tensor* k_slice = ggml_view_2d(ctx_, k_storage_fmt, n_embd_k, 1, k_storage_fmt->nb[1], k_offset);
-        
-        size_t v_offset = i * v_storage_fmt->nb[2];
-        ggml_tensor* v_slice = ggml_view_2d(ctx_, v_storage_fmt, n_embd_v, 1, v_storage_fmt->nb[1], v_offset);
-        
-        // Copy to storage at correct slot and position
-        ggml_tensor* k_stored = kv_cache->cpy_k(ctx_, k_slice, layer_idx, slots[i]);
-        set_tensor_name(gf, k_stored, "k_stored_b", il);
-        ggml_build_forward_expand(gf, k_stored);
-        
-        ggml_tensor* v_stored = kv_cache->cpy_v(ctx_, v_slice, layer_idx, slots[i]);
-        set_tensor_name(gf, v_stored, "v_stored_b", il);
-        ggml_build_forward_expand(gf, v_stored);
-    }
-    
-    // 2. Gather KV Cache for Attention (Read Step)
-    // We need the full history for each slot.
-    // For now, assume all slots have same history length (max_pos) or we take the max.
-    // The mask will handle the raggedness.
-    
-    // Find max position to determine Gather length
-    uint32_t max_pos = 0;
-    for (int32_t p : positions) {
-        if (p > (int32_t)max_pos) max_pos = (uint32_t)p;
-    }
-    uint32_t n_kv_len = max_pos + 1; // inclusive of current token
-    
-    // Gather returns [n_embd, n_kv_len, n_batch]
-    ggml_tensor* k_gathered = kv_cache->gather_k(ctx_, gf, layer_idx, gather_indices, n_batch, n_kv_len);
-    ggml_tensor* v_gathered = kv_cache->gather_v(ctx_, gf, layer_idx, gather_indices, n_batch, n_kv_len);
-    
-    // 3. Prepare for Attention
-    // k_gathered is [n_embd, n_kv_len, n_batch]
-    // We need [n_embd_head, n_head_kv, n_kv_len, n_batch]
-    
-    ggml_tensor* k_view = ggml_view_4d(ctx_, k_gathered,
-        n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_k * sizeof(float),
-        n_embd_k * n_kv_len * sizeof(float),
-        0);
-        
-    ggml_tensor* v_view = ggml_view_4d(ctx_, v_gathered,
-        n_embd_head, n_head_kv, n_kv_len, n_batch,
-        n_embd_head * sizeof(float),
-        n_embd_v * sizeof(float),
-        n_embd_v * n_kv_len * sizeof(float),
-        0);
-        
-    // 4. Compute Attention
-    return build_attn_mha(gf, q, k_view, v_view, kq_mask, nullptr, kq_scale, 0, il);
-}
-
-ggml_tensor * Qwen3ForwardPass::_build_attention_layer(
-    ggml_cgraph * gf,
-    simple_kv_cache * kv_cache,
-    ggml_tensor * q, 
-    ggml_tensor * k, 
-    ggml_tensor * v,
-    int layer_idx, 
-    float kq_scale,
-    uint32_t n_tokens,
-    uint32_t slot_idx,
-    int il) {
-    const uint32_t pos = kv_cache->get_pos(slot_idx);
-    const uint32_t n_kv = pos + n_tokens;
-
-    // 1. Cache the new K and V values
-    ggml_tensor * k_cached = kv_cache->cpy_k(ctx_, k, layer_idx, slot_idx);
-    set_tensor_name(gf, k_cached, "k_cached", il);
-    ggml_build_forward_expand(gf, k_cached);
-
-    ggml_tensor * v_cached = kv_cache->cpy_v(ctx_, v, layer_idx, slot_idx);
-    set_tensor_name(gf, v_cached, "v_cached", il);
-    ggml_build_forward_expand(gf, v_cached);
-
-    // 2. Retrieve the full K and V sequences from the cache (up to current position)
-    ggml_tensor * k_full = kv_cache->get_k(ctx_, layer_idx, n_kv, slot_idx);
-    ggml_tensor * v_full = kv_cache->get_v(ctx_, layer_idx, n_kv, slot_idx);
-
-    // 3. Create views for the attention calculation
-    // k_full is [n_embd_k=1024, n_kv], need [128, 8, n_kv, 1]
-
-    int hidden_dim = meta_.embedding_length;
-    int n_head = meta_.attention_head_count;
-    int n_embd_head;
-    if (meta_.architecture == "qwen3") {
-        n_embd_head = meta_.attention_key_length;
-    } else { // qwen2
-        n_embd_head = hidden_dim / n_head;
-    }
-    int n_head_kv = meta_.attention_head_count_kv;
-    int n_embd_k = n_head_kv * n_embd_head;
-    int n_embd_v = n_head_kv * n_embd_head;
-
-    k = ggml_view_3d(ctx_, k_full, 
-        n_embd_head,      // head dimension: n_embd_k / n_head_kv
-        n_head_kv,        // n_head_kv
-        n_kv,             // cached sequence length
-        n_embd_head * sizeof(float),   // nb[1]: stride between heads
-        n_embd_k * sizeof(float),      // nb[2]: stride between tokens
-        0);
-
-    // v_full is [n_embd_v, n_kv], need [n_embd_head, n_head_kv, n_kv]
-    v = ggml_view_3d(ctx_, v_full,
-        n_embd_head,      // head dimension: n_embd_v / n_head_kv
-        n_head_kv,
-        n_kv,             // cached sequence length
-        n_embd_head * sizeof(float),   // nb[1]: stride between heads
-        n_embd_v * sizeof(float),      // nb[2]: stride between tokens
-        0);
-
-
-    set_tensor_name(gf, k, "k_view", il);
-    set_tensor_name(gf, v, "v_view", il);
-
-    // 4. Build the causal mask for the full sequence
-    // char mask_name[32];
-    // snprintf(mask_name, sizeof(mask_name), "kq_mask_%d", layer_idx);
-
-    ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, n_kv, n_tokens);
-    // ggml_set_input(kq_mask);
-    set_tensor_name(gf, kq_mask, "kq_mask", il);
-    ggml_build_forward_expand(gf, kq_mask);
-
-    // 5. Execute attention with the cached values
-    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_mask, nullptr, kq_scale, pos, il);
-    return cur;
-}
+// _build_attention_layer and _build_batched_attention_layer have been
+// extracted to src/layers/attention.cpp as build_attention() and
+// build_batched_attention(). Call sites updated to use the free functions.
 
 
 // Set input data AFTER allocation
@@ -883,8 +720,8 @@ ggml_cgraph* Qwen3ForwardPass::_build_single_layer_graph(
 
     // C. Attention
     float kq_scale = 1.0f / sqrtf(float(n_embd_head));
-    cur = _build_attention_layer(gf, tq_scratch_cache_.get(), Qcur, Kcur, Vcur,
-        scratch_layer, kq_scale, n_tokens, slot_idx, il);
+    cur = build_attention(ctx_, gf, tq_scratch_cache_.get(), Qcur, Kcur, Vcur,
+        scratch_layer, kq_scale, n_tokens, slot_idx, il, n_embd_head, n_head_kv);
 
     // D. Output projection + residual
     cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
@@ -892,7 +729,7 @@ ggml_cgraph* Qwen3ForwardPass::_build_single_layer_graph(
 
     // E. FFN
     cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-    cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
+    cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
         block.ffn_down_weight, il);
 
     // F. FFN residual
@@ -981,15 +818,15 @@ ggml_cgraph* Qwen3ForwardPass::_build_layer_batch_graph(
 
         // Attention — each layer uses its persistent scratch cache slot (il)
         const float kq_scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
-        cur = _build_attention_layer(gf, tq_scratch_cache_.get(), Qcur, Kcur, Vcur,
-            il, kq_scale, n_tokens, slot_idx, il);
+        cur = build_attention(ctx_, gf, tq_scratch_cache_.get(), Qcur, Kcur, Vcur,
+            il, kq_scale, n_tokens, slot_idx, il, n_embd_head, n_head_kv);
 
         // Output projection + residuals
         cur = ggml_mul_mat(ctx_, block.attn_output_weight, cur);
         ggml_tensor* ffn_inp = ggml_add(ctx_, cur, inpSA);
 
         cur = build_norm(gf, ffn_inp, block.ffn_norm_weight, il);
-        cur = ffn_swiglu(gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
+        cur = build_ffn_swiglu(ctx_, gf, cur, block.ffn_gate_weight, block.ffn_up_weight,
             block.ffn_down_weight, il);
         cur = ggml_add(ctx_, cur, ffn_inp);
     }

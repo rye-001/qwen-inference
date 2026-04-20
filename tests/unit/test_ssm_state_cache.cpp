@@ -12,7 +12,7 @@
 #include <vector>
 #include <numeric>
 
-#include "../../src/kv-cache/ssm-state-cache.h"
+#include "../../src/state/ssm_state_cache.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 

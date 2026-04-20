@@ -17,10 +17,10 @@
 
 // Your existing headers
 #include "qwen3-core/qwen3-model.h"
-#include "qwen3-core/forward-pass.h"
-#include "qwen3-core/tokenizer.h"
+#include "models/qwen3.h"
+#include "loader/tokenizer.h"
 #include "sampling/sampling.h"
-#include "kv-cache/simple-kv-cache.h"
+#include "state/kv_cache_simple.h"
 
 #include <iostream>
 #include <thread>

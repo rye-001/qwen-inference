@@ -1,9 +1,9 @@
 #pragma once
 
-#include "forward-pass-base.h"
-#include "../kv-cache/simple-kv-cache.h"
-#include "../kv-cache/ssm-state-cache.h"
-#include "../kv-cache/compressed_kv_store.h"
+#include "forward_pass_base.h"
+#include "../state/kv_cache_simple.h"
+#include "../state/ssm_state_cache.h"
+#include "../state/kv_cache_compressed.h"
 
 /**
  * Forward pass for Qwen3.5 hybrid SSM/attention architecture.

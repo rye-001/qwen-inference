@@ -42,7 +42,6 @@ core.*
 *.gguf
 *.ggml
 *.bin
-models/
 
 # Python cache
 __pycache__/

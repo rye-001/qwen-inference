@@ -6,8 +6,8 @@ add_executable(qwen3-cli
 )
 
 target_link_libraries(qwen3-cli PRIVATE
+    qinf-models
     qwen3-core
-    qwen3-kv-cache
     sampling
     ggml
     Threads::Threads

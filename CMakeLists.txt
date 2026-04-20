@@ -75,7 +75,6 @@ include_directories(${ggml_SOURCE_DIR}/include)
 
 # Core library components
 add_subdirectory(src/qwen3-core)
-add_subdirectory(src/kv-cache)
 add_subdirectory(src/sampling)
 
 # Main CLI executable
@@ -83,6 +82,13 @@ add_subdirectory(src/cli)
 
 # HTTP Server
 add_subdirectory(src/server)
+
+# New modular structure (stubs — populated by Phase 1 extraction PRs 1.2–1.6)
+add_subdirectory(src/layers)
+add_subdirectory(src/state)
+add_subdirectory(src/models)
+add_subdirectory(src/loader)
+add_subdirectory(src/quant)
 
 # Optional components
 if(QWEN3_BUILD_TESTS)

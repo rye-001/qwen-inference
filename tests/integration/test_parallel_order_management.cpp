@@ -1,7 +1,8 @@
 #include "qwen3-core/qwen3-model.h"
-#include "qwen3-core/gguf-loader.h"
-#include "qwen3-core/forward-pass-factory.h"
-#include "qwen3-core/tokenizer.h"
+#include "loader/gguf_loader.h"
+#include "models/qwen3.h"
+#include "models/qwen35.h"
+#include "loader/tokenizer.h"
 #include "sampling/sampling.h"
 #include "sampling/vocab_utils.h"
 #include <memory>
@@ -481,8 +482,11 @@ public:
             tokenizer_ = std::make_unique<Tokenizer>(&model_->get_metadata());
 
             // Initialize forward pass with batch support
-            forward_pass_ = create_forward_pass(
-                *model_, &model_->get_metadata(), 2048, max_batch_size_);
+            const auto& meta = model_->get_metadata();
+            if (meta.architecture == "qwen35")
+                forward_pass_ = std::make_unique<Qwen35ForwardPass>(*model_, &meta, 2048, max_batch_size_);
+            else
+                forward_pass_ = std::make_unique<Qwen3ForwardPass>(*model_, &meta, 2048, max_batch_size_);
 
             precompute_system_prompt();
 

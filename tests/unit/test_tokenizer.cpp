@@ -1,7 +1,7 @@
 #include "gtest/gtest.h"
-#include "qwen3-core/tokenizer.h"
+#include "loader/tokenizer.h"
 #include "qwen3-core/qwen3-model.h"
-#include "qwen3-core/gguf-loader.h"
+#include "loader/gguf_loader.h"
 #include <memory>
 #include <vector>
 #include <string>

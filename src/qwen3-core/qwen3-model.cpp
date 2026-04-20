@@ -1,6 +1,6 @@
 #include "qwen3-model.h"
-#include "gguf-loader.h"
-#include "tokenizer.h"
+#include "../loader/gguf_loader.h"
+#include "../loader/tokenizer.h"
 #include "ggml-cpu.h"
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"

@@ -2,8 +2,8 @@
 // TDD tests for the compressed KV backing store.
 // No ggml, no model — pure C++ data structure tests.
 
-#include "compressed_kv_store.h"
-#include "turboquant.h"
+#include "../../src/state/kv_cache_compressed.h"
+#include "../../src/state/turboquant.h"
 #include <gtest/gtest.h>
 #include <vector>
 #include <random>
