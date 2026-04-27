@@ -320,6 +320,14 @@ void Qwen3Model::assign_tensor_pointers(const std::unordered_map<std::string, gg
                 blocks_[i].attn_q_bias        = tensors.at(prefix + "attn_q.bias");
                 blocks_[i].attn_k_bias        = tensors.at(prefix + "attn_k.bias");
                 blocks_[i].attn_v_bias        = tensors.at(prefix + "attn_v.bias");
+            } else if (metadata_.architecture == "gemma") {
+                // Gemma 1: GQA, no QK-norm, no biases, GeGLU FFN.
+                // Norm form is (1+w) — applied at graph time, not at load time.
+                blocks_[i].ffn_norm_weight    = tensors.at(prefix + "ffn_norm.weight");
+                blocks_[i].attn_q_weight      = tensors.at(prefix + "attn_q.weight");
+                blocks_[i].attn_k_weight      = tensors.at(prefix + "attn_k.weight");
+                blocks_[i].attn_v_weight      = tensors.at(prefix + "attn_v.weight");
+                blocks_[i].attn_output_weight = tensors.at(prefix + "attn_output.weight");
             }
         }
     }
@@ -334,7 +342,8 @@ bool Qwen3Model::validate_architecture() const
         return false;
     }
     return metadata_.architecture == "qwen3" || metadata_.architecture == "qwen2" ||
-           metadata_.architecture == "qwen35" || metadata_.architecture == "qwen35moe";
+           metadata_.architecture == "qwen35" || metadata_.architecture == "qwen35moe" ||
+           metadata_.architecture == "gemma";
 }
 
 Qwen3ModelSize Qwen3Model::detect_model_size() const

@@ -59,6 +59,172 @@ static Qwen3Metadata make_byte_level_metadata() {
     return m;
 }
 
+// ── Inventory schema tests (PR G1.2) ──────────────────────────────────────────
+
+// Build a minimal Qwen3Metadata with a synthetic tensor inventory for tests.
+// Tensor types and shapes are not exercised here — only required-key presence.
+static TensorMetadata fake_tensor(const std::string& name) {
+    TensorMetadata t;
+    t.name = name;
+    t.type = GGML_TYPE_F32;
+    t.shape = {1};
+    t.offset = 0;
+    return t;
+}
+
+static Qwen3Metadata make_complete_gemma_inventory(uint32_t blocks = 2) {
+    Qwen3Metadata m;
+    m.architecture = "gemma";
+    m.block_count = blocks;
+    m.tensor_inventory["token_embd.weight"] = fake_tensor("token_embd.weight");
+    m.tensor_inventory["output_norm.weight"] = fake_tensor("output_norm.weight");
+    const std::vector<std::string> per_block = {
+        "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+        "attn_norm.weight", "ffn_norm.weight"
+    };
+    for (uint32_t i = 0; i < blocks; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        for (const auto& t : per_block) {
+            m.tensor_inventory[p + t] = fake_tensor(p + t);
+        }
+    }
+    return m;
+}
+
+static Qwen3Metadata make_complete_qwen3_inventory(uint32_t blocks = 2) {
+    Qwen3Metadata m;
+    m.architecture = "qwen3";
+    m.block_count = blocks;
+    m.tensor_inventory["token_embd.weight"] = fake_tensor("token_embd.weight");
+    m.tensor_inventory["output_norm.weight"] = fake_tensor("output_norm.weight");
+    const std::vector<std::string> per_block = {
+        "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight",
+        "ffn_up.weight", "ffn_down.weight"
+    };
+    for (uint32_t i = 0; i < blocks; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        for (const auto& t : per_block) {
+            m.tensor_inventory[p + t] = fake_tensor(p + t);
+        }
+    }
+    return m;
+}
+
+TEST(InventorySchema, GemmaCompleteInventoryPasses) {
+    auto m = make_complete_gemma_inventory();
+    EXPECT_NO_THROW(validate_gemma_inventory(m));
+    EXPECT_NO_THROW(validate_inventory_for_architecture(m));
+}
+
+TEST(InventorySchema, GemmaMissingGlobalTensorFailsLoudly) {
+    auto m = make_complete_gemma_inventory();
+    m.tensor_inventory.erase("output_norm.weight");
+    try {
+        validate_gemma_inventory(m);
+        FAIL() << "expected GGUFLoadError";
+    } catch (const GGUFLoadError& e) {
+        const std::string msg(e.what());
+        EXPECT_NE(msg.find("gemma"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("output_norm.weight"), std::string::npos) << msg;
+    }
+}
+
+TEST(InventorySchema, GemmaMissingPerBlockTensorFailsLoudly) {
+    auto m = make_complete_gemma_inventory(3);
+    m.tensor_inventory.erase("blk.1.ffn_down.weight");
+    try {
+        validate_gemma_inventory(m);
+        FAIL() << "expected GGUFLoadError";
+    } catch (const GGUFLoadError& e) {
+        const std::string msg(e.what());
+        EXPECT_NE(msg.find("blk.1.ffn_down.weight"), std::string::npos) << msg;
+    }
+}
+
+TEST(InventorySchema, GemmaTiedEmbeddingsAcceptedNoSeparateOutput) {
+    // Gemma reuses token_embd.weight for the LM head — no `output.weight`.
+    // Validator must NOT require output.weight.
+    auto m = make_complete_gemma_inventory();
+    EXPECT_TRUE(m.tensor_inventory.find("output.weight") == m.tensor_inventory.end());
+    EXPECT_NO_THROW(validate_gemma_inventory(m));
+}
+
+TEST(InventorySchema, Qwen3InventoryUnaffectedByDispatch) {
+    auto m = make_complete_qwen3_inventory();
+    EXPECT_NO_THROW(validate_inventory_for_architecture(m));
+}
+
+TEST(InventorySchema, DispatchUnknownArchitectureFailsLoudly) {
+    Qwen3Metadata m;
+    m.architecture = "totally_unknown";
+    try {
+        validate_inventory_for_architecture(m);
+        FAIL() << "expected GGUFLoadError";
+    } catch (const GGUFLoadError& e) {
+        const std::string msg(e.what());
+        EXPECT_NE(msg.find("validate_inventory_for_architecture"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("got 'totally_unknown'"), std::string::npos) << msg;
+    }
+}
+
+// ── Architecture allow-list tests (PR G1.1) ───────────────────────────────────
+
+TEST(Loader, ArchitectureAllowListAcceptsQwen3) {
+    QwenGGUFLoader loader;
+    Qwen3Metadata m; m.architecture = "qwen3";
+    EXPECT_NO_THROW(loader.validate_architecture(m));
+}
+
+TEST(Loader, ArchitectureAllowListAcceptsQwen2) {
+    QwenGGUFLoader loader;
+    Qwen3Metadata m; m.architecture = "qwen2";
+    EXPECT_NO_THROW(loader.validate_architecture(m));
+}
+
+TEST(Loader, ArchitectureAllowListAcceptsQwen35) {
+    QwenGGUFLoader loader;
+    Qwen3Metadata m; m.architecture = "qwen35";
+    EXPECT_NO_THROW(loader.validate_architecture(m));
+}
+
+TEST(Loader, ArchitectureAllowListAcceptsQwen35Moe) {
+    QwenGGUFLoader loader;
+    Qwen3Metadata m; m.architecture = "qwen35moe";
+    EXPECT_NO_THROW(loader.validate_architecture(m));
+}
+
+TEST(Loader, ArchitectureAllowListAcceptsGemma) {
+    QwenGGUFLoader loader;
+    Qwen3Metadata m; m.architecture = "gemma";
+    EXPECT_NO_THROW(loader.validate_architecture(m));
+}
+
+TEST(Loader, ArchitectureAllowListRejectsUnknownWithFailLoudFormat) {
+    QwenGGUFLoader loader;
+    Qwen3Metadata m; m.architecture = "unknown_arch_xyz";
+    try {
+        loader.validate_architecture(m);
+        FAIL() << "expected GGUFLoadError for unknown architecture";
+    } catch (const GGUFLoadError& e) {
+        const std::string msg(e.what());
+        // Fail-loud contract: name the parameter, expected value, then actual.
+        EXPECT_NE(msg.find("validate_architecture"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("expected one of"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("got 'unknown_arch_xyz'"), std::string::npos) << msg;
+        // Allow-list members must appear in the message so users can self-correct.
+        EXPECT_NE(msg.find("'gemma'"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("'qwen3'"), std::string::npos) << msg;
+    }
+}
+
+TEST(Loader, ArchitectureAllowListRejectsEmpty) {
+    QwenGGUFLoader loader;
+    Qwen3Metadata m; m.architecture = "";
+    EXPECT_THROW(loader.validate_architecture(m), GGUFLoadError);
+}
+
 // ── GGUFLoader build tests ────────────────────────────────────────────────────
 
 TEST(Loader, GGUFLoaderDefaultConstructs) {

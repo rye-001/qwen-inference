@@ -24,7 +24,6 @@
 class Qwen3Model;
 
 namespace qwen3 {
-    class Grammar;
     class SpeculativeDecoder;
 }
 

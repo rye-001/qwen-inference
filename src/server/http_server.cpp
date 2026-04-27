@@ -20,6 +20,7 @@
 #include "models/qwen3.h"
 #include "models/qwen35.h"
 #include "models/qwen36.h"
+#include "models/model_registry.h"
 #include "loader/tokenizer.h"
 #include "sampling/sampling.h"
 #include "state/kv_cache_simple.h"
@@ -91,15 +92,9 @@ public:
         
         // Initialize forward pass with MAX_SLOTS slots
         const auto& srv_meta = model_.get_metadata();
-        if (srv_meta.architecture == "qwen35moe")
-            forward_pass_ = std::make_unique<Qwen36ForwardPass>(
-                model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
-        else if (srv_meta.architecture == "qwen35")
-            forward_pass_ = std::make_unique<Qwen35ForwardPass>(
-                model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
-        else
-            forward_pass_ = std::make_unique<Qwen3ForwardPass>(
-                model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS);
+        register_builtin_models();
+        forward_pass_ = create_forward_pass(
+            model_, &srv_meta, max_ctx_per_slot_, MAX_SLOTS, /*kv_quant_bits=*/0);
         
         scheduler_ = model_.get_scheduler();
         

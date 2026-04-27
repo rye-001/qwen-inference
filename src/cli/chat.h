@@ -31,7 +31,6 @@ struct ChatMessage;
 
 namespace qwen3 {
     class Sampler;
-    class Grammar;
     class SpeculativeDecoder;
 }
 

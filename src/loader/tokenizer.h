@@ -69,4 +69,17 @@ private:
     std::vector<std::string> byte_encoder_;
     std::unordered_map<std::string, int32_t> byte_decoder_;
     void initialize_byte_mapping();
+
+    // ── llama / SentencePiece-derived tokenizer (e.g. Gemma) ────────────────
+    // When metadata_->tokenizer_type == "llama", the existing GPT-2 byte-level
+    // BPE path is bypassed in favor of score-based Viterbi over normalized text
+    // with byte-fallback for unknown codepoints. The diff is the encode/decode
+    // algorithm — vocabulary, special-token table, and unk_token_id_ are
+    // populated by the same constructor.
+    bool                    is_llama_tokenizer_ = false;
+    std::vector<int32_t>    byte_fallback_ids_;     // 256 entries when llama
+    std::vector<float>      scores_;                // alias of metadata_->scores
+    void initialize_llama_byte_fallback();
+    std::vector<int32_t>    encode_llama(const std::string& text) const;
+    std::string             decode_llama(int32_t token_id) const;
 };

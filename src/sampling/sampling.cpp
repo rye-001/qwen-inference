@@ -1,6 +1,4 @@
 #include "sampling.h"
-// grammar_vocab.h is pulled in via sampling.h.
-// grammar.h and pretokenized_literals.h are no longer needed.
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>

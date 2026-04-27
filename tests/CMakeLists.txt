@@ -324,6 +324,45 @@ target_link_libraries(qwen3-weight-binding-tests PRIVATE
 target_compile_features(qwen3-weight-binding-tests PRIVATE cxx_std_17)
 gtest_discover_tests(qwen3-weight-binding-tests)
 
+# Gemma 1 forward pass integration test (PR G1.5).
+# Self-skips when the canonical Gemma file is absent.
+add_executable(qwen3-gemma1-forward-tests
+    unit/test_gemma1_forward.cpp
+)
+target_link_libraries(qwen3-gemma1-forward-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-loader
+    qwen3-core
+    ggml
+)
+target_compile_features(qwen3-gemma1-forward-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-gemma1-forward-tests)
+
+# Chat template unit tests (PR G1.7) — header-only, no link deps.
+add_executable(qwen3-chat-template-tests
+    unit/test_chat_template.cpp
+)
+target_link_libraries(qwen3-chat-template-tests PRIVATE
+    GTest::gtest_main
+)
+target_include_directories(qwen3-chat-template-tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_compile_features(qwen3-chat-template-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-chat-template-tests)
+
+# Gemma tokenizer unit tests (PR G1.3) — no model file needed.
+add_executable(qwen3-gemma-tokenizer-tests
+    unit/test_tokenizer_gemma.cpp
+)
+target_link_libraries(qwen3-gemma-tokenizer-tests PRIVATE
+    GTest::gtest_main
+    qinf-loader
+)
+target_compile_features(qwen3-gemma-tokenizer-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-gemma-tokenizer-tests)
+
 # Loader unit tests (no model file needed).
 # Covers: GGUFLoader construction, Tokenizer build, ASCII round-trip.
 add_executable(qwen3-loader-tests
@@ -337,6 +376,21 @@ target_link_libraries(qwen3-loader-tests PRIVATE
 
 target_compile_features(qwen3-loader-tests PRIVATE cxx_std_17)
 gtest_discover_tests(qwen3-loader-tests)
+
+# Model registry tests (PR G1.6) — no model file needed.
+add_executable(qwen3-model-registry-tests
+    unit/test_model_registry.cpp
+)
+
+target_link_libraries(qwen3-model-registry-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qwen3-core
+    ggml
+)
+
+target_compile_features(qwen3-model-registry-tests PRIVATE cxx_std_17)
+gtest_discover_tests(qwen3-model-registry-tests)
 
 # TransformerBlock unit tests — no model file needed.
 # Covers: build succeeds, output finite/shape, scratch budget, Qwen2 bias path.

@@ -111,3 +111,12 @@ std::unique_ptr<QwenGGUFLoader> create_gguf_loader();
 // fail-loud error contract without needing a real GGUF file.
 // Throws GGUFLoadError naming the missing tensor if any required key is absent.
 void validate_qwen35moe_inventory(const Qwen3Metadata& meta);
+
+// Validates a Gemma-1 tensor inventory. Same fail-loud contract:
+// names the architecture, the slot, the expected vs actual.
+void validate_gemma_inventory(const Qwen3Metadata& meta);
+
+// Dispatches inventory validation based on meta.architecture.
+// Throws GGUFLoadError for an unsupported architecture (with the same
+// fail-loud format as validate_architecture).
+void validate_inventory_for_architecture(const Qwen3Metadata& meta);

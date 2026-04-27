@@ -41,8 +41,8 @@ struct Qwen3Metadata {
     uint32_t vocab_size;
     uint32_t attention_key_length;
     uint32_t attention_value_length;
-    float rope_freq_base;
-    float rms_norm_eps;
+    float rope_freq_base = 0.0f;
+    float rms_norm_eps   = 0.0f;
 
     // SSM/hybrid fields (qwen35 and qwen35moe)
     uint32_t ssm_conv_kernel = 0;        // *.ssm.conv_kernel
@@ -65,11 +65,13 @@ struct Qwen3Metadata {
     std::vector<std::string> id_to_token;    // tokenizer.ggml.tokens [151936 elements]
     std::vector<TokenType> token_types;      // tokenizer.ggml.token_type [151936 elements]
     std::vector<std::string> merges;         // tokenizer.ggml.merges [151387 elements]
-    
+    std::vector<float>      scores;          // tokenizer.ggml.scores (llama/sentencepiece)
+
     // Special token IDs (from GGUF)
     int32_t eos_token_id = -1;       // 151645
-    int32_t bos_token_id = -1;       // 151643  
+    int32_t bos_token_id = -1;       // 151643
     int32_t padding_token_id = -1;   // 151643
+    int32_t unknown_token_id = -1;   // tokenizer.ggml.unknown_token_id
     bool add_bos_token = false;
     
     std::unordered_map<std::string, TensorMetadata> tensor_inventory;

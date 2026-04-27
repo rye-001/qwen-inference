@@ -28,6 +28,8 @@ static constexpr std::string_view KEY_TOKENIZER_EOS_TOKEN_ID = "tokenizer.ggml.e
 static constexpr std::string_view KEY_TOKENIZER_BOS_TOKEN_ID = "tokenizer.ggml.bos_token_id";
 static constexpr std::string_view KEY_TOKENIZER_PADDING_TOKEN_ID = "tokenizer.ggml.padding_token_id";
 static constexpr std::string_view KEY_TOKENIZER_ADD_BOS_TOKEN = "tokenizer.ggml.add_bos_token";
+static constexpr std::string_view KEY_TOKENIZER_UNK_TOKEN_ID = "tokenizer.ggml.unknown_token_id";
+static constexpr std::string_view KEY_TOKENIZER_SCORES = "tokenizer.ggml.scores";
 
 struct GGUFHeader
 {
@@ -210,15 +212,35 @@ size_t QwenGGUFLoader::calculate_tensor_bytes(const TensorMetadata &meta) const
     return ggml_type_size(meta.type) * elements / ggml_blck_size(meta.type);
 }
 
+// Allow-list of supported model architectures. Order is the message order.
+// Adding a family here is necessary but not sufficient — the inventory schema
+// (validate_tensor_inventory) and a model recipe must also be in place.
+static const std::vector<std::string>& supported_architectures()
+{
+    static const std::vector<std::string> kArchs = {
+        "qwen2", "qwen3", "qwen35", "qwen35moe", "gemma"
+    };
+    return kArchs;
+}
+
 void QwenGGUFLoader::validate_architecture(const Qwen3Metadata &meta) const
 {
-    if (meta.architecture != "qwen3" && meta.architecture != "qwen2" &&
-        meta.architecture != "qwen35" && meta.architecture != "qwen35moe")
-    {
-        throw GGUFLoadError("Invalid model architecture: '" + meta.architecture +
-                            "', expected one of: 'qwen3', 'qwen2', 'qwen35', 'qwen35moe'");
+    const auto& archs = supported_architectures();
+    for (const auto& a : archs) {
+        if (meta.architecture == a) {
+            std::cout << "Validated model architecture: " << meta.architecture << std::endl;
+            return;
+        }
     }
-    std::cout << "Validated model architecture: " << meta.architecture << std::endl;
+
+    std::string allow_list;
+    for (size_t i = 0; i < archs.size(); ++i) {
+        if (i) allow_list += ", ";
+        allow_list += "'" + archs[i] + "'";
+    }
+    throw GGUFLoadError(
+        "validate_architecture: expected one of: " + allow_list +
+        ", got '" + meta.architecture + "'");
 }
 
 void QwenGGUFLoader::unload_model()
@@ -340,6 +362,18 @@ void QwenGGUFLoader::parse_and_validate_metadata(size_t& offset)
         } else if (key == KEY_TOKENIZER_ADD_BOS_TOKEN) {
             if (type != GGUFValueType::BOOL) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_ADD_BOS_TOKEN) + " has unexpected type.");
             metadata_.add_bos_token = read_value_from_mem<bool>(offset);
+        } else if (key == KEY_TOKENIZER_UNK_TOKEN_ID) {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_UNK_TOKEN_ID) + " has unexpected type.");
+            metadata_.unknown_token_id = read_value_from_mem<uint32_t>(offset);
+        } else if (key == KEY_TOKENIZER_SCORES) {
+            if (type != GGUFValueType::ARRAY) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_SCORES) + " has unexpected type.");
+            const GGUFValueType array_type = read_value_from_mem<GGUFValueType>(offset);
+            if (array_type != GGUFValueType::FLOAT32) throw GGUFLoadError("Tokenizer scores array must be FLOAT32.");
+            const uint64_t n = read_value_from_mem<uint64_t>(offset);
+            metadata_.scores.resize(n);
+            for (uint64_t i = 0; i < n; ++i) {
+                metadata_.scores[i] = read_value_from_mem<float>(offset);
+            }
         } else if (key == prefix + "ssm.conv_kernel") {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError(key + " has unexpected type.");
             metadata_.ssm_conv_kernel = read_value_from_mem<uint32_t>(offset);
@@ -476,81 +510,123 @@ void validate_qwen35moe_inventory(const Qwen3Metadata& meta)
     }
 }
 
-void QwenGGUFLoader::validate_tensor_inventory() const
+void validate_gemma_inventory(const Qwen3Metadata& meta)
 {
-    std::cout << "Validating tensor inventory..." << std::endl;
-    const auto &inventory = metadata_.tensor_inventory;
+    const auto& inventory = meta.tensor_inventory;
+    auto require = [&](const std::string& name) {
+        if (inventory.find(name) == inventory.end()) {
+            throw GGUFLoadError(
+                "gemma: missing tensor '" + name +
+                "': expected in model weights, got absent");
+        }
+    };
 
-    if (metadata_.architecture == "qwen35moe") {
-        validate_qwen35moe_inventory(metadata_);
-        std::cout << "Tensor inventory validation passed." << std::endl;
-        return;
+    // Tied embeddings: no separate output.weight.
+    require("token_embd.weight");
+    require("output_norm.weight");
+
+    static const std::vector<std::string> per_block = {
+        "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight",
+        "ffn_up.weight", "ffn_down.weight"
+    };
+    for (uint32_t i = 0; i < meta.block_count; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        for (const auto& t : per_block) require(p + t);
     }
+}
 
-    // Global tensors
-    if (inventory.find("token_embd.weight") == inventory.end()) {
-        throw GGUFLoadError("Validation failed: Missing 'token_embd.weight'");
+namespace {
+void validate_qwen2_or_3_inventory(const Qwen3Metadata& meta)
+{
+    const auto& inventory = meta.tensor_inventory;
+    auto require = [&](const std::string& name, const std::string& ctx) {
+        if (inventory.find(name) == inventory.end()) {
+            throw GGUFLoadError(
+                meta.architecture + ": missing tensor '" + name +
+                "': expected in " + ctx + ", got absent");
+        }
+    };
+    require("token_embd.weight", "model weights");
+    require("output_norm.weight", "model weights");
+
+    static const std::vector<std::string> per_block = {
+        "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight",
+        "ffn_up.weight", "ffn_down.weight"
+    };
+    for (uint32_t i = 0; i < meta.block_count; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        for (const auto& t : per_block) require(p + t, "block " + std::to_string(i));
     }
-    if (inventory.find("output_norm.weight") == inventory.end()) {
-        throw GGUFLoadError("Validation failed: Missing 'output_norm.weight'");
-    }
+}
 
-    for (uint32_t i = 0; i < metadata_.block_count; ++i) {
-        const std::string prefix = "blk." + std::to_string(i) + ".";
+void validate_qwen35_inventory(const Qwen3Metadata& meta)
+{
+    const auto& inventory = meta.tensor_inventory;
+    auto require = [&](const std::string& name, const std::string& ctx) {
+        if (inventory.find(name) == inventory.end()) {
+            throw GGUFLoadError(
+                "qwen35: missing tensor '" + name +
+                "': expected in " + ctx + ", got absent");
+        }
+    };
+    require("token_embd.weight", "model weights");
+    require("output_norm.weight", "model weights");
 
-        if (metadata_.architecture == "qwen35") {
-            // Shared tensors (both layer types)
-            const std::vector<std::string> shared_tensors = {
-                "attn_norm.weight", "post_attention_norm.weight",
-                "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"
-            };
-            for (const auto& t : shared_tensors) {
-                if (inventory.find(prefix + t) == inventory.end()) {
-                    throw GGUFLoadError("Validation failed: Missing '" + prefix + t + "'");
-                }
-            }
-
-            if (metadata_.is_full_attention_layer(i)) {
-                // Full attention layer tensors
-                const std::vector<std::string> attn_tensors = {
-                    "attn_q.weight", "attn_k.weight", "attn_v.weight",
-                    "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
-                };
-                for (const auto& t : attn_tensors) {
-                    if (inventory.find(prefix + t) == inventory.end()) {
-                        throw GGUFLoadError("Validation failed: Missing '" + prefix + t + "' for attention layer " + std::to_string(i));
-                    }
-                }
-            } else {
-                // SSM (GatedDeltaNet) layer tensors
-                const std::vector<std::string> ssm_tensors = {
-                    "ssm_a", "ssm_conv1d.weight", "ssm_dt.bias",
-                    "ssm_alpha.weight", "ssm_beta.weight",
-                    "attn_qkv.weight", "attn_gate.weight",
-                    "ssm_norm.weight", "ssm_out.weight"
-                };
-                for (const auto& t : ssm_tensors) {
-                    if (inventory.find(prefix + t) == inventory.end()) {
-                        throw GGUFLoadError("Validation failed: Missing '" + prefix + t + "' for SSM layer " + std::to_string(i));
-                    }
-                }
-            }
-        } else {
-            // Original validation for qwen2/qwen3
-            const std::vector<std::string> required_tensors = {
-                "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
-                "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight",
-                "ffn_up.weight", "ffn_down.weight"
-            };
-            for (const auto& t_name : required_tensors) {
-                const std::string full_name = prefix + t_name;
-                if (inventory.find(full_name) == inventory.end()) {
-                    throw GGUFLoadError("Validation failed: Missing tensor '" + full_name + "' for block " + std::to_string(i));
-                }
+    static const std::vector<std::string> shared = {
+        "attn_norm.weight", "post_attention_norm.weight",
+        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"
+    };
+    static const std::vector<std::string> attn_tensors = {
+        "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"
+    };
+    static const std::vector<std::string> ssm_tensors = {
+        "ssm_a", "ssm_conv1d.weight", "ssm_dt.bias",
+        "ssm_alpha.weight", "ssm_beta.weight",
+        "attn_qkv.weight", "attn_gate.weight",
+        "ssm_norm.weight", "ssm_out.weight"
+    };
+    for (uint32_t i = 0; i < meta.block_count; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        for (const auto& t : shared) require(p + t, "block " + std::to_string(i));
+        const auto& chosen = meta.is_full_attention_layer(i) ? attn_tensors : ssm_tensors;
+        const std::string kind = meta.is_full_attention_layer(i) ? "attention" : "SSM";
+        for (const auto& t : chosen) {
+            if (inventory.find(p + t) == inventory.end()) {
+                throw GGUFLoadError(
+                    "qwen35: missing tensor '" + p + t +
+                    "': expected in " + kind + " layer " + std::to_string(i) +
+                    ", got absent");
             }
         }
     }
+}
+} // namespace
 
+void validate_inventory_for_architecture(const Qwen3Metadata& meta)
+{
+    if (meta.architecture == "qwen2" || meta.architecture == "qwen3") {
+        validate_qwen2_or_3_inventory(meta);
+    } else if (meta.architecture == "qwen35") {
+        validate_qwen35_inventory(meta);
+    } else if (meta.architecture == "qwen35moe") {
+        validate_qwen35moe_inventory(meta);
+    } else if (meta.architecture == "gemma") {
+        validate_gemma_inventory(meta);
+    } else {
+        throw GGUFLoadError(
+            "validate_inventory_for_architecture: expected one of: "
+            "'qwen2', 'qwen3', 'qwen35', 'qwen35moe', 'gemma', got '" +
+            meta.architecture + "'");
+    }
+}
+
+void QwenGGUFLoader::validate_tensor_inventory() const
+{
+    std::cout << "Validating tensor inventory..." << std::endl;
+    validate_inventory_for_architecture(metadata_);
     std::cout << "Tensor inventory validation passed." << std::endl;
 }
 

@@ -2,6 +2,7 @@
 #include <fstream>
 
 #include "chat.h"
+#include "../models/model_registry.h"
 
 int run_chat(
     Qwen3Model& model,
@@ -55,13 +56,9 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         
         std::vector<int32_t> all_tokens; // Accumulate all tokens here
         const auto& chat_meta = model.get_metadata();
-        std::unique_ptr<ForwardPassBase> forward_pass;
-        if (chat_meta.architecture == "qwen35moe")
-            forward_pass = std::make_unique<Qwen36ForwardPass>(model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
-        else if (chat_meta.architecture == "qwen35")
-            forward_pass = std::make_unique<Qwen35ForwardPass>(model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
-        else
-            forward_pass = std::make_unique<Qwen3ForwardPass>(model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
+        register_builtin_models();
+        std::unique_ptr<ForwardPassBase> forward_pass = create_forward_pass(
+            model, &chat_meta, args.context_length, 2, args.kv_quant_bits);
         forward_pass->set_snapkv_config(args.snapkv_budget, args.snapkv_window);
         ggml_backend_sched_t scheduler = model.get_scheduler();
         std::vector<ChatMessage> chat_history;
@@ -85,7 +82,8 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         chat_history.push_back({"system", system_content});
         std::cout << "System Prompt: " << system_content << std::endl;
 
-        std::string system_turn = apply_chat_template({chat_history.back()}, false);
+        const ChatTemplateKind tmpl_kind = detect_chat_template(chat_meta.architecture);
+        std::string system_turn = apply_chat_template({chat_history.back()}, tmpl_kind, false);
         std::vector<int32_t> system_tokens = tokenizer->encode(system_turn);
         log_tokens(system_tokens);
         all_tokens.insert(all_tokens.end(), system_tokens.begin(), system_tokens.end());
@@ -128,7 +126,7 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             chat_history.push_back({"user", user_input});
 
             // Format only the new user turn for tokenization
-            std::string turn_prompt = apply_chat_template({{"user", user_input}});
+            std::string turn_prompt = apply_chat_template({{"user", user_input}}, tmpl_kind, true);
             std::vector<int32_t> new_tokens = tokenizer->encode(turn_prompt);
             log_tokens(new_tokens);
             
@@ -199,9 +197,12 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             }
             end_chat_generation:
 
-            // After generation ends, we must add the <|im_end|>\n tokens to the cache
-            // so the next turn sees a properly terminated assistant message
-            std::string im_end_suffix = "<|im_end|>\n";
+            // After generation ends, append the architecture-appropriate
+            // turn-end marker so the next turn sees a properly terminated
+            // assistant message.
+            std::string im_end_suffix = (tmpl_kind == ChatTemplateKind::Gemma)
+                                            ? "<end_of_turn>\n"
+                                            : "<|im_end|>\n";
             std::vector<int32_t> im_end_tokens = tokenizer->encode(im_end_suffix);
             int end_pos = forward_pass->get_cache_pos(session_slot);
             

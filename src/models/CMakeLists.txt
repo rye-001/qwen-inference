@@ -8,6 +8,8 @@ add_library(qinf-models STATIC
     qwen3.cpp
     qwen35.cpp
     qwen36.cpp
+    gemma1.cpp
+    model_registry.cpp
 )
 
 target_include_directories(qinf-models PUBLIC
