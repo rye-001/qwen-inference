@@ -456,12 +456,29 @@ add_executable(qwen3-model-registry-tests
 target_link_libraries(qwen3-model-registry-tests PRIVATE
     GTest::gtest_main
     qinf-models
-    qwen3-core
+    qinf-loader
+    core
     ggml
 )
 
-target_compile_features(qwen3-model-registry-tests PRIVATE cxx_std_17)
-gtest_discover_tests(qwen3-model-registry-tests)
+target_compile_features(loader-tests PRIVATE cxx_std_17)
+gtest_discover_tests(loader-tests)
+
+# Model registry tests (PR G1.6) — no model file needed.
+add_executable(model-registry-tests
+    unit/test_model_registry.cpp
+)
+
+target_link_libraries(model-registry-tests PRIVATE
+    GTest::gtest_main
+    qinf-models
+    qinf-loader
+    core
+    ggml
+)
+
+target_compile_features(model-registry-tests PRIVATE cxx_std_17)
+gtest_discover_tests(model-registry-tests)
 
 # TransformerBlock unit tests — no model file needed.
 # Covers: build succeeds, output finite/shape, scratch budget, Qwen2 bias path.
