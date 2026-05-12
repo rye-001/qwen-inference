@@ -47,11 +47,27 @@ include(FetchContent)
 set(FETCHCONTENT_QUIET ON)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 
+#
+# Vendored ggml is patched with our downstream-only fused ops via the
+# patches/ directory. patches/apply-all.sh iterates patches/*.patch in
+# lexical order, dry-run-checking each before applying so reconfigures are
+# idempotent (FETCHCONTENT_UPDATES_DISCONNECTED already suppresses re-fetch;
+# the dry-run check guards against double-apply in mixed-state trees).
+#
+# See: docs/plan-deltanet-fusion.md for context on why we patch downstream
+# rather than fork or upstream.
+#
+file(GLOB QINF_GGML_PATCH_FILES "${CMAKE_SOURCE_DIR}/patches/*.patch")
+if(QINF_GGML_PATCH_FILES)
+    message(STATUS "qinf: ggml patches detected: ${QINF_GGML_PATCH_FILES}")
+endif()
+
 FetchContent_Declare(
   ggml
   GIT_REPOSITORY https://github.com/ggerganov/llama.cpp.git
   GIT_TAG        b8390
   SOURCE_SUBDIR  ggml
+  PATCH_COMMAND  bash "${CMAKE_SOURCE_DIR}/patches/apply-all.sh" "${CMAKE_SOURCE_DIR}/patches"
 )
 
 # Set GGML options to minimal configuration
@@ -90,6 +106,9 @@ add_subdirectory(src/state)
 add_subdirectory(src/models)
 add_subdirectory(src/loader)
 add_subdirectory(src/quant)
+if(APPLE)
+    add_subdirectory(src/metal)
+endif()
 
 # Optional components
 if(QWEN3_BUILD_TESTS)

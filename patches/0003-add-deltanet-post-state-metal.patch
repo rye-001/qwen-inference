@@ -1,0 +1,296 @@
+From: qinf-build <build@qinf.local>
+Subject: [PATCH] qinf: add ggml_deltanet_post_state Metal backend (Phase 4)
+
+PR 4.2.A — qinf downstream patch.
+
+Adds the Metal backend for GGML_OP_DELTANET_POST_STATE: the fused kernel
+itself (kernel_deltanet_post_state_f32 in ggml-metal.metal), the
+dispatch case + ggml_metal_op_deltanet_post_state op function, the
+supports_op gate, the pipeline lookup, and the kargs struct.
+
+This is the GPU half of the op introduced by 0002. Constraints:
+  - F32 dst + all srcs
+  - src0/src1/src2 contiguous
+  - ne00 (head_v_dim) % 32 == 0  (one simdgroup of reduction per row)
+
+If supports_op returns false (e.g. quantized inputs slip in), the ggml
+scheduler falls back to the CPU forward from 0002 — partial-Metal does
+not break correctness.
+
+Equivalence verified by tests/unit/test_deltanet_post_state.cpp on both
+CPU and Metal backends, same tolerance band (1e-5 abs / 1e-4 rel,
+matching the gated_delta_net upstream test).
+
+Apply order: must be applied AFTER 0001 and 0002. apply-all.sh
+enforces lexical order of patches/*.patch.
+
+Files touched:
+  ggml/src/ggml-metal/ggml-metal-impl.h     — kargs struct
+  ggml/src/ggml-metal/ggml-metal-device.h   — pipeline-lookup decl
+  ggml/src/ggml-metal/ggml-metal-device.cpp — pipeline-lookup impl
+  ggml/src/ggml-metal/ggml-metal-device.m   — supports_op case
+  ggml/src/ggml-metal/ggml-metal-ops.h      — op-fn decl
+  ggml/src/ggml-metal/ggml-metal-ops.cpp    — dispatch case + op fn
+  ggml/src/ggml-metal/ggml-metal.metal      — kernel_deltanet_post_state_f32
+
+---
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 72ad876d5..5573cd819 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -612,6 +612,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
+     return res;
+ }
+ 
++// qinf downstream patch — pipeline lookup for ggml_deltanet_post_state.
++// Single F32 variant; constraints enforced in supports_op (F32 + contiguous + ne00 % 32 == 0).
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_deltanet_post_state(ggml_metal_library_t lib, const ggml_tensor * op) {
++    assert(op->op == GGML_OP_DELTANET_POST_STATE);
++    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
++    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
++    GGML_ASSERT(op->src[2]->type == GGML_TYPE_F32);
++    GGML_ASSERT(op->src[0]->ne[0] % 32 == 0);
++
++    char base[256];
++    char name[256];
++
++    snprintf(base, 256, "kernel_deltanet_post_state_f32");
++    snprintf(name, 256, "%s", base);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++    }
++
++    res.smem = 32*sizeof(float);
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
+     char base[256];
+     char name[256];
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index fd2b3ddeb..3b04ccf52 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -126,6 +126,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_deltanet_post_state(ggml_metal_library_t lib, const struct ggml_tensor * op); // qinf downstream patch
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, enum ggml_type tsrc0, enum ggml_type tsrc1, int nsg, int nxpsg, int r1ptg);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 82101f471..a9887ee5b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1158,6 +1158,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+             return true;
+         case GGML_OP_GATED_DELTA_NET:
+             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
++        case GGML_OP_DELTANET_POST_STATE: // qinf downstream patch
++            return has_simdgroup_reduction
++                && op->type          == GGML_TYPE_F32
++                && op->src[0]->type  == GGML_TYPE_F32
++                && op->src[1]->type  == GGML_TYPE_F32
++                && op->src[2]->type  == GGML_TYPE_F32
++                && ggml_is_contiguous(op->src[0])
++                && ggml_is_contiguous(op->src[1])
++                && ggml_is_contiguous(op->src[2])
++                && op->src[0]->ne[0] % 32 == 0;
+         case GGML_OP_SOLVE_TRI:
+         case GGML_OP_MUL_MAT:
+         case GGML_OP_MUL_MAT_ID:
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 53437b23c..2387f8984 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -832,6 +832,23 @@ typedef struct {
+     uint64_t nb3;
+ } ggml_metal_kargs_gated_delta_net;
+ 
++// qinf downstream patch — see qwen-inference/patches/0003-add-deltanet-post-state-metal.patch
++// Fused post-state epoxy: rms_norm(x, eps) * w_norm * silu(z).
++// src0 = x, src1 = z (same shape), src2 = w_norm [ne00] broadcast.
++typedef struct {
++    int32_t  ne00;
++    uint64_t nb01;
++    uint64_t nb02;
++    uint64_t nb03;
++    uint64_t nb11;
++    uint64_t nb12;
++    uint64_t nb13;
++    uint64_t nb1;
++    uint64_t nb2;
++    uint64_t nb3;
++    float    eps;
++} ggml_metal_kargs_deltanet_post_state;
++
+ typedef struct {
+     int32_t  ne00;
+     int32_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index c0bcad392..7f82ee07b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -337,6 +337,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
+             } break;
++        case GGML_OP_DELTANET_POST_STATE: // qinf downstream patch
++            {
++                n_fuse = ggml_metal_op_deltanet_post_state(ctx, idx);
++            } break;
+         case GGML_OP_SOLVE_TRI:
+             {
+                 n_fuse = ggml_metal_op_solve_tri(ctx, idx);
+@@ -1641,6 +1645,65 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++// qinf downstream patch — Metal dispatch for fused DeltaNet post-state op.
++// Mirrors the CPU forward in ggml/src/ggml-cpu/ops.cpp:
++//   gated[i] = (x[i] / rms(x_row) * w_norm[i]) * silu(z[i])
++// with rms(x_row) = sqrt(mean(x_row^2) + eps).
++// One threadgroup per row (i01, i02, i03); 32 threads (one simdgroup) per group;
++// each thread strides across ne00 (head_v_dim, multiple of 32 — gated by supports_op).
++int ggml_metal_op_deltanet_post_state(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
++    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
++    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
++
++    float eps;
++    memcpy(&eps, op->op_params, sizeof(float));
++
++    auto pipeline = ggml_metal_library_get_pipeline_deltanet_post_state(lib, op);
++
++    ggml_metal_kargs_deltanet_post_state args = {
++        /*.ne00 =*/ ne00,
++        /*.nb01 =*/ nb01,
++        /*.nb02 =*/ nb02,
++        /*.nb03 =*/ nb03,
++        /*.nb11 =*/ nb11,
++        /*.nb12 =*/ nb12,
++        /*.nb13 =*/ nb13,
++        /*.nb1  =*/ nb1,
++        /*.nb2  =*/ nb2,
++        /*.nb3  =*/ nb3,
++        /*.eps  =*/ eps,
++    };
++
++    int nth = 32; // SIMD width
++    while (nth < ne00 && nth < (int) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
++        nth *= 2;
++    }
++    nth = std::min(nth, (int) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++    nth = std::min(nth, ne00);
++
++    const size_t smem = pipeline.smem;
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                  0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // x
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // z
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3); // w_norm
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4); // dst
++
++    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
++
++    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
++
++    return 1;
++}
++
+ int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 019f2fec9..62fda15e9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -59,6 +59,7 @@ int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_deltanet_post_state(ggml_metal_op_t ctx, int idx); // qinf downstream patch
+ int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_cpy               (ggml_metal_op_t ctx, int idx);
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index b2328605d..c68e7464d 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -2659,6 +2659,65 @@ template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta
+ template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float4, 4>;
+ #endif
+ 
++// qinf downstream patch — fused DeltaNet post-state.
++// gated[i] = (x[i] / rms(x_row) * w_norm[i]) * silu(z[i])
++// with rms(x_row) = sqrt(mean(x_row^2) + eps).
++// Layout: src0 (x), src1 (z), dst all share shape [ne00, ne01, ne02, ne03];
++// src2 (w_norm) is [ne00] broadcast across the leading dims.
++// One threadgroup per row (i01, i02, i03); thread.x strides across ne00.
++// Reduction pattern mirrors kernel_rms_norm_fuse_impl<float, 1>.
++kernel void kernel_deltanet_post_state_f32(
++        constant ggml_metal_kargs_deltanet_post_state & args,
++        device const char * src0, // x
++        device const char * src1, // z
++        device const char * src2, // w_norm [ne00]
++        device       char * dst,
++        threadgroup float * shmem_f32 [[threadgroup(0)]],
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort  sgitg[[simdgroup_index_in_threadgroup]],
++        ushort  tiisg[[thread_index_in_simdgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    if (sgitg == 0) {
++        shmem_f32[tiisg] = 0.0f;
++    }
++
++    const int i01 = tgpig.x;
++    const int i02 = tgpig.y;
++    const int i03 = tgpig.z;
++
++    device const float * x = (device const float *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
++    device const float * z = (device const float *) (src1 + i03*args.nb13 + i02*args.nb12 + i01*args.nb11);
++    device const float * w = (device const float *) src2;
++    device       float * y = (device       float *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
++
++    float sumf = 0.0f;
++    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
++        sumf += x[i00] * x[i00];
++    }
++    sumf = simd_sum(sumf);
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    if (tiisg == 0) {
++        shmem_f32[sgitg] = sumf;
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    sumf = shmem_f32[tiisg];
++    sumf = simd_sum(sumf);
++
++    const float mean  = sumf / (float) args.ne00;
++    const float scale = 1.0f / sqrt(mean + args.eps);
++
++    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
++        const float zi      = z[i00];
++        const float silu_zi = zi / (1.0f + exp(-zi));
++        y[i00] = x[i00] * scale * w[i00] * silu_zi;
++    }
++}
++
+ constant short FC_solve_tri_nsg [[function_constant(FC_SOLVE_TRI + 0)]];
+ constant short FC_solve_tri_n   [[function_constant(FC_SOLVE_TRI + 1)]];
+ constant short FC_solve_tri_k   [[function_constant(FC_SOLVE_TRI + 2)]];

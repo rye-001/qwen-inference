@@ -1,0 +1,20 @@
+{
+  "_note": "Phase 4 investigation: coarse total per-layer DeltaNet decode cost. Computed as full−baseline to cancel the per-iter scheduler launch overhead floor. Sub-stage attribution is intentionally not provided; if DeltaNet ranks as the largest budget chunk, a sub-stage breakdown is the next step.",
+  "architecture": "qwen35moe",
+  "baseline_ms": 0.09675,
+  "conv_channels": 8192,
+  "conv_kernel": 4,
+  "d_inner": 4096,
+  "dn_decode_ms": 1.066166,
+  "generated_at": "2026-05-07T07:19:54Z",
+  "head_k_dim": 128,
+  "head_v_dim": 128,
+  "layer_idx": 0,
+  "model_path": "./Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf",
+  "n_embd": 2048,
+  "num_k_heads": 16,
+  "num_v_heads": 32,
+  "per_layer_ms": 0.9694159999999999,
+  "timed_iters": 200,
+  "warmup_iters": 10
+}
