@@ -1,0 +1,77 @@
+{
+  "_note": "Phase 4 PR-1 sub-stage breakdown of DeltaNet decode-path cost. Stage costs computed as deltas between cumulative sub-graph timings. per_layer_ms = total_cumulative_ms \u2212 baseline_ms; verdict evaluates out_proj as a fraction of per_layer_ms. Individual stage deltas are indicative \u2014 Metal can run adjacent ops in parallel within a single command buffer, so attribution to a specific stage is fuzzy; totals are robust. The first stage (qkv_proj) additionally absorbs JIT kernel-pipeline compilation on first run, which can drive subsequent stage deltas slightly negative.",
+  "architecture": "qwen35moe",
+  "baseline_ms": 0.092625,
+  "conv_channels": 8192,
+  "conv_kernel": 4,
+  "d_inner": 4096,
+  "generated_at": "2026-05-08T18:43:28Z",
+  "head_k_dim": 128,
+  "head_v_dim": 128,
+  "layer_idx": 0,
+  "model_path": "./Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf",
+  "n_embd": 2048,
+  "num_k_heads": 16,
+  "num_v_heads": 32,
+  "per_layer_ms": 0.9682090000000001,
+  "stages": [
+    {
+      "cumulative_ms": 0.424292,
+      "delta_ms": 0.424292,
+      "delta_us": 424.29200000000003,
+      "pct_of_per_layer": 43.822356536656855,
+      "pct_of_total": 39.996078557059825,
+      "stage": "qkv_proj"
+    },
+    {
+      "cumulative_ms": 0.623708,
+      "delta_ms": 0.19941600000000004,
+      "delta_us": 199.41600000000003,
+      "pct_of_per_layer": 20.596379500706977,
+      "pct_of_total": 18.798040032653557,
+      "stage": "gate_proj"
+    },
+    {
+      "cumulative_ms": 0.824792,
+      "delta_ms": 0.20108399999999993,
+      "delta_us": 201.08399999999992,
+      "pct_of_per_layer": 20.76865635415493,
+      "pct_of_total": 18.955274812081807,
+      "stage": "conv_update"
+    },
+    {
+      "cumulative_ms": 0.941417,
+      "delta_ms": 0.11662499999999998,
+      "delta_us": 116.62499999999997,
+      "pct_of_per_layer": 12.045436470844619,
+      "pct_of_total": 10.99370872351376,
+      "stage": "state_update"
+    },
+    {
+      "cumulative_ms": 1.141583,
+      "delta_ms": 0.20016600000000007,
+      "delta_us": 200.16600000000005,
+      "pct_of_per_layer": 20.673842114667394,
+      "pct_of_total": 18.868739124123103,
+      "stage": "out_norm"
+    },
+    {
+      "cumulative_ms": 1.060834,
+      "delta_ms": -0.08074899999999996,
+      "delta_us": -80.74899999999997,
+      "pct_of_per_layer": -8.340038152919456,
+      "pct_of_total": -7.611841249432047,
+      "stage": "out_proj"
+    }
+  ],
+  "timed_iters": 200,
+  "total_cumulative_ms": 1.060834,
+  "verdict": {
+    "classification": "launch-bound",
+    "out_proj_ms": -0.08074899999999996,
+    "out_proj_pct_of_layer": -8.340038152919456,
+    "recommendation": "fused-kernel: small ops (excluding out_proj) collectively dominate, suggesting per-dispatch overhead is fusable. Proceed with PR 4.2 (fused DeltaNet decode-step kernel).",
+    "threshold_pct": 40.0
+  },
+  "warmup_iters": 10
+}

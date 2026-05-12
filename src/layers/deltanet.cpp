@@ -134,14 +134,21 @@ ggml_tensor* build_deltanet_layer(
 
     // ── 5. L2-normalise Q and K ───────────────────────────────────────────────
 
-    q_conv = ggml_l2_norm(ctx, q_conv, rms_norm_eps);
-    k_conv = ggml_l2_norm(ctx, k_conv, rms_norm_eps);
+    // PR 4.2.B: l2_norm × 2 + repeat_4d × 2 fused into a single dispatch via
+    // ggml_deltanet_pre_state. Output packs Q and K into one tensor; we view
+    // it back into separate Q and K to keep the gated_delta_net call site
+    // unchanged. See patches/0004 (CPU) and patches/0005 (Metal).
+    ggml_tensor* qk_packed = ggml_deltanet_pre_state(ctx,
+        q_conv, k_conv, num_v_heads, rms_norm_eps);
+    dn_set_name(gf, qk_packed, "dn_qk_packed", il);
 
-    // Repeat K heads to match V heads if needed (GQA-style grouping)
-    if (num_k_heads != num_v_heads) {
-        q_conv = ggml_repeat_4d(ctx, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_conv = ggml_repeat_4d(ctx, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-    }
+    q_conv = ggml_view_4d(ctx, qk_packed,
+        head_k_dim, num_v_heads, n_seq_tokens, n_seqs,
+        qk_packed->nb[1], qk_packed->nb[2], qk_packed->nb[3], 0);
+    k_conv = ggml_view_4d(ctx, qk_packed,
+        head_k_dim, num_v_heads, n_seq_tokens, n_seqs,
+        qk_packed->nb[1], qk_packed->nb[2], qk_packed->nb[3],
+        static_cast<size_t>(head_k_dim) * num_v_heads * ggml_element_size(qk_packed));
 
     // ── 6. Gated delta-net recurrence (fused op) ──────────────────────────────
 
@@ -190,11 +197,12 @@ ggml_tensor* build_deltanet_layer(
     // output is [head_v_dim, num_v_heads, n_seq_tokens, n_seqs].
     // Normalize each head_v_dim vector independently (per-head, not d_inner-wide).
     // w_norm is [head_v_dim]; ggml broadcasts it over all heads and tokens.
-    ggml_tensor* z_4d   = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
-    ggml_tensor* normed = ggml_rms_norm(ctx, output, rms_norm_eps);
-    normed = ggml_mul(ctx, normed, w_norm);
-    ggml_tensor* z_silu = ggml_silu(ctx, z_4d);
-    ggml_tensor* gated  = ggml_mul(ctx, normed, z_silu);
+    // PR 4.2.A: rms_norm + mul(w_norm) + silu(z) + mul fused into a single
+    // dispatch via ggml_deltanet_post_state (qinf downstream patch). See
+    // patches/0002 (CPU) and patches/0003 (Metal). The Metal supports_op
+    // gate routes back to the CPU forward if any precondition fails.
+    ggml_tensor* z_4d  = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor* gated = ggml_deltanet_post_state(ctx, output, z_4d, w_norm, rms_norm_eps);
     dn_set_name(gf, gated, "dn_gated", il);
 
     // ── 8. Output projection ─────────────────────────────────────────────────

@@ -40,8 +40,15 @@ Key principles:
 
 - All layer modules must share one `ggml_context` and build into one `ggml_cgraph`.
 - Avoid premature `ggml_cont()` / `ggml_cpy()` — they pin scratch buffer memory.
-- MoE dispatch must use a fused `ggml_custom_op`, not chained `ggml_mul_mat` per
-  expert (kernel launch overhead on Metal kills performance otherwise).
+- MoE dispatch is built on three batched `ggml_mul_mat_id` calls per layer
+  (gate / up / down), each backed by a native Metal `MUL_MAT_ID` kernel. C-level
+  launch count is O(1) in `n_experts`. Do **not** introduce `ggml_custom_op`
+  paths — the Metal backend's `supports_op` table has no case for
+  `GGML_OP_CUSTOM` / `GGML_OP_MAP_CUSTOM*`, so any such node is scheduled to
+  CPU. If MoE-side optimization is ever revisited, the candidate is patching
+  ggml-metal's `MUL_MAT_ID` kernel for sparse routing, not graph-level fusion.
+  See [docs/phase4-investigation.md](docs/phase4-investigation.md) — measured
+  ceiling on Qwen 3.6 ≤ 1.13×.
 - KV cache (append semantics) and recurrent state (overwrite semantics) are
   fundamentally different — never unify their implementations behind a shared base
   that assumes one update pattern.
@@ -70,6 +77,15 @@ engineering wins and the rule is revised. Full list in
   explicit over clever and terse. No template metaprogramming, runtime
   reflection, or multi-level indirection. Generated code lives under
   `src/generated/` and is never hand-edited.
+
+## Architecture Pressure Test
+
+How we judge whether a proposed change is healthy or quietly corrosive:
+
+- **Architecture earns its keep by surviving real pressure, not by looking clean in isolation.** A design that has only ever hosted Qwen variants has not been falsified yet. New requirements (a new model family, a new attention variant, a new state type) are *forcing functions* that validate or invalidate the abstraction. We adopt them when they sharpen module boundaries; we resist them when they would require special cases.
+- **Parameterize or split — pick the conceptual seam, case by case.** A sliding-window mask is a parameter on attention; p-RoPE is a parameter on RoPE; PLE is its own module because it is a different signal flow, not a knob on embeddings. Both failure modes are real and equally bad: a model zoo of parallel modules, *and* a fat function whose params are orthogonal silos that no single call site uses together. Neither default ("always parameterize" or "always split") is safe. This is a judgment call that needs on-demand attention at design time — flag it explicitly when it comes up, do not let it ride.
+- **No model zoo.** We do not add support for a model because it exists. We add it when (a) it is a forcing function for clarifying the architecture, or (b) it is a credible production target. Both bars are high. The failure mode we are explicitly avoiding is the `llama.cpp` trap: support every model, accumulate special cases, end up with a giant switch statement and no real abstraction.
+- **Success metric for any cross-family or cross-variant change: "the architecture hosted X without bending."** If implementing X required non-trivial edits to existing layer modules (not new optional parameters — actual logic edits to code other recipes depend on), treat it as an interface defect, not a feature win. Pause and fix the interface.
 
 ## Collaboration Style
 

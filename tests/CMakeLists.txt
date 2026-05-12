@@ -214,6 +214,46 @@ target_link_libraries(deltanet-tests PRIVATE
 target_compile_features(deltanet-tests PRIVATE cxx_std_17)
 gtest_discover_tests(deltanet-tests)
 
+# PR 4.2.A — equivalence test for ggml_deltanet_post_state (qinf-patched ggml op).
+# Exercises the fused op against the chained 4-op reference (rms_norm + mul +
+# silu + mul). Parameterized over CPU and Metal backends; the Metal case
+# self-skips when GGML_USE_METAL is OFF. No model file needed.
+add_executable(deltanet-post-state-tests
+    unit/test_deltanet_post_state.cpp
+)
+
+target_link_libraries(deltanet-post-state-tests PRIVATE
+    GTest::gtest_main
+    ggml
+)
+
+if(GGML_USE_METAL)
+    target_link_libraries(deltanet-post-state-tests PRIVATE ggml-metal)
+endif()
+
+target_compile_features(deltanet-post-state-tests PRIVATE cxx_std_17)
+gtest_discover_tests(deltanet-post-state-tests)
+
+# PR 4.2.B — equivalence test for ggml_deltanet_pre_state (qinf-patched ggml op).
+# Exercises the fused op against the chained 4-op reference (l2_norm × 2 +
+# repeat_4d × 2). Parameterized over CPU and Metal backends; the Metal case
+# self-skips when GGML_USE_METAL is OFF. No model file needed.
+add_executable(deltanet-pre-state-tests
+    unit/test_deltanet_pre_state.cpp
+)
+
+target_link_libraries(deltanet-pre-state-tests PRIVATE
+    GTest::gtest_main
+    ggml
+)
+
+if(GGML_USE_METAL)
+    target_link_libraries(deltanet-pre-state-tests PRIVATE ggml-metal)
+endif()
+
+target_compile_features(deltanet-pre-state-tests PRIVATE cxx_std_17)
+gtest_discover_tests(deltanet-pre-state-tests)
+
 # MoELayer tests (PR 3.M.1-3) — no model file needed.
 add_executable(moe-tests
     unit/test_moe.cpp
@@ -689,3 +729,116 @@ target_link_libraries(tq-prefill-tests PRIVATE
 
 target_compile_features(tq-prefill-tests PRIVATE cxx_std_17)
 gtest_discover_tests(tq-prefill-tests)
+
+# ── Phase 4 tools ─────────────────────────────────────────────────────────────
+
+# PR 4.0 — Performance baseline.
+# Not a GTest binary — run manually, pipe output to the fixture file.
+# Requires QWEN36_MODEL_PATH and/or GEMMA4_MODEL_PATH env vars.
+add_executable(perf-baseline
+    perf/perf_baseline.cpp
+)
+
+target_compile_definitions(perf-baseline PRIVATE
+    CANARY_PROMPTS_DEFAULT="${CMAKE_SOURCE_DIR}/tests/fixtures/canary_prompts_gemma.txt"
+)
+
+target_link_libraries(perf-baseline PRIVATE
+    qinf-models
+    qinf-loader
+    core
+    sampling
+    nlohmann_json::nlohmann_json
+    ggml
+)
+
+target_compile_features(perf-baseline PRIVATE cxx_std_17)
+
+# PR 4.1 investigation — per-stage MoE timing.
+# Disposable: once the breakdown identifies the right fusion shape, this binary
+# can be deleted (or kept as a regression check).
+add_executable(moe-breakdown
+    perf/moe_breakdown.cpp
+)
+
+target_link_libraries(moe-breakdown PRIVATE
+    qinf-models
+    qinf-loader
+    core
+    sampling
+    nlohmann_json::nlohmann_json
+    ggml
+)
+
+target_compile_features(moe-breakdown PRIVATE cxx_std_17)
+
+# Phase 4 investigation — per-stage gated-attention timing.
+# Disposable: shares the breakdown_harness.h pattern with moe-breakdown.
+add_executable(attention-breakdown
+    perf/attention_breakdown.cpp
+)
+
+target_link_libraries(attention-breakdown PRIVATE
+    qinf-models
+    qinf-loader
+    qinf-state
+    core
+    sampling
+    nlohmann_json::nlohmann_json
+    ggml
+)
+
+target_compile_features(attention-breakdown PRIVATE cxx_std_17)
+
+# Phase 4 investigation — per-layer DeltaNet decode cost (coarse).
+add_executable(deltanet-breakdown
+    perf/deltanet_breakdown.cpp
+)
+
+target_link_libraries(deltanet-breakdown PRIVATE
+    qinf-models
+    qinf-loader
+    qinf-layers
+    qinf-state
+    core
+    sampling
+    nlohmann_json::nlohmann_json
+    ggml
+)
+
+target_compile_features(deltanet-breakdown PRIVATE cxx_std_17)
+
+# Phase 4 PR-1 — DeltaNet sub-stage decode breakdown (resolves Q1 in
+# docs/phase4-investigation.md: launch-bound vs. matmul-bound).
+add_executable(deltanet-substage-breakdown
+    perf/deltanet_substage_breakdown.cpp
+)
+
+target_link_libraries(deltanet-substage-breakdown PRIVATE
+    qinf-models
+    qinf-loader
+    qinf-layers
+    qinf-state
+    core
+    sampling
+    nlohmann_json::nlohmann_json
+    ggml
+)
+
+target_compile_features(deltanet-substage-breakdown PRIVATE cxx_std_17)
+
+# Phase 4 investigation — RMSNorm marginal cost at decode shape.
+add_executable(norms-breakdown
+    perf/norms_breakdown.cpp
+)
+
+target_link_libraries(norms-breakdown PRIVATE
+    qinf-models
+    qinf-loader
+    core
+    sampling
+    nlohmann_json::nlohmann_json
+    ggml
+)
+
+target_compile_features(norms-breakdown PRIVATE cxx_std_17)

@@ -1,0 +1,25 @@
+From: qinf-build <build@qinf.local>
+Subject: [PATCH] qinf: sentinel comment proving PATCH_COMMAND wiring
+
+This is a no-op patch that adds a single sentinel comment near the top of
+ggml.h. Its purpose is to verify that CMake's FetchContent PATCH_COMMAND is
+wired correctly, applies cleanly on first fetch, and is idempotent on
+subsequent reconfigures.
+
+Real fused-op patches (PR 4.2.A onward — ggml_deltanet_post_state, etc.)
+land alongside this sentinel as separate numbered patch files.
+
+---
+ ggml/include/ggml.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 0000000..0000000 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1,3 +1,5 @@
++// QINF_PATCH_SENTINEL: this header is patched at FetchContent time by qwen-inference;
++// see patches/ in the qwen-inference repo for the patch series.
+ #pragma once
+
+ //

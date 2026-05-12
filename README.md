@@ -27,7 +27,7 @@ You probably should! [llama.cpp](https://github.com/ggerganov/llama.cpp) support
 - **OpenAI-compatible API** — `/v1/completions` with SSE streaming. Drop-in for existing tools.
 - **Grammar-constrained generation** — GBNF grammars with a precomputed token-trie for fast constrained decoding.
 - **Speculative decoding** — Prompt-lookup based, no draft model needed.
-- **Metal acceleration** — Apple Silicon via ggml's Metal backend.
+- **Metal acceleration** — Apple Silicon via ggml's Metal backend, with custom fused DeltaNet kernels (`patches/`) for Qwen 3.5 / 3.6 decode.
 
 ## Supported Models
 

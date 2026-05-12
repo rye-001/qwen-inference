@@ -1,0 +1,42 @@
+{
+  "_note": "Phase 4 investigation: RMSNorm marginal cost at decode shape [n_embd, 1]. Chains of 0/1/2/4/8/16 norms — per-norm μs is the delta divided by chain-length increment. 0→1 absorbs scheduler launch overhead; 1→2, 2→4, 4→8 deltas are the load-bearing values.",
+  "architecture": "qwen35moe",
+  "chains": [
+    {
+      "cumulative_ms": 0.235917,
+      "n_norms": 0,
+      "per_norm_us": 0.0
+    },
+    {
+      "cumulative_ms": 0.096667,
+      "n_norms": 1,
+      "per_norm_us": -139.24999999999997
+    },
+    {
+      "cumulative_ms": 0.107708,
+      "n_norms": 2,
+      "per_norm_us": 11.040999999999995
+    },
+    {
+      "cumulative_ms": 0.120084,
+      "n_norms": 4,
+      "per_norm_us": 6.187999999999999
+    },
+    {
+      "cumulative_ms": 0.151208,
+      "n_norms": 8,
+      "per_norm_us": 7.781000000000003
+    },
+    {
+      "cumulative_ms": 0.216458,
+      "n_norms": 16,
+      "per_norm_us": 8.15625
+    }
+  ],
+  "generated_at": "2026-05-07T07:22:10Z",
+  "model_path": "./Qwen3.6-35B-A3B-UD-Q2_K_XL.gguf",
+  "n_embd": 2048,
+  "rms_norm_eps": 9.999999974752427e-07,
+  "timed_iters": 200,
+  "warmup_iters": 10
+}
