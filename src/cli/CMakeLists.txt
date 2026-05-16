@@ -3,6 +3,7 @@ add_executable(qwenium-cli
     complete.cpp
     chat.cpp
     main.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
 )
 
 target_link_libraries(qwenium-cli PRIVATE

@@ -901,15 +901,14 @@ ggml_cgraph* Qwen35ForwardPass::build_decoding_graph(
         inpL = cur;
     }
 
-    // 5. Output head
-    cur = build_norm(gf, inpL, model_.get_output_norm_weight(), -1);
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
-    }
-    ggml_set_name(cur, "logits");
-    ggml_build_forward_expand(gf, cur);
+    // 5. Output head — shared helper (final norm + LM head). Routes through
+    //    build_output_head so the sparse decode path (sparse_decode_ids_ →
+    //    ggml_get_rows on the output weight) is honored, matching the prefill
+    //    path (line ~265) and Qwen3.6. Dense behavior is unchanged: with no
+    //    sparse ids armed, this is build_norm + ggml_mul_mat over the full
+    //    output weight (or token-embedding fallback), identical to the prior
+    //    hand-rolled code.
+    build_output_head(gf, inpL);
 
     return gf;
 }

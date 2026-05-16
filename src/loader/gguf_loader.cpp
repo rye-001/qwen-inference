@@ -26,6 +26,7 @@ static constexpr std::string_view KEY_TOKENIZER_TOKENS = "tokenizer.ggml.tokens"
 static constexpr std::string_view KEY_TOKENIZER_TOKEN_TYPE = "tokenizer.ggml.token_type";
 static constexpr std::string_view KEY_TOKENIZER_MERGES = "tokenizer.ggml.merges";
 static constexpr std::string_view KEY_TOKENIZER_EOS_TOKEN_ID = "tokenizer.ggml.eos_token_id";
+static constexpr std::string_view KEY_TOKENIZER_EOT_TOKEN_ID = "tokenizer.ggml.eot_token_id";
 static constexpr std::string_view KEY_TOKENIZER_BOS_TOKEN_ID = "tokenizer.ggml.bos_token_id";
 static constexpr std::string_view KEY_TOKENIZER_PADDING_TOKEN_ID = "tokenizer.ggml.padding_token_id";
 static constexpr std::string_view KEY_TOKENIZER_ADD_BOS_TOKEN = "tokenizer.ggml.add_bos_token";
@@ -260,6 +261,7 @@ void GGUFLoader::parse_and_validate_metadata(size_t& offset)
     const std::string prefix = metadata_.architecture + ".";
 
     // Second pass: parse all metadata using the correct prefix
+    int32_t eot_token_id = -1; // populated if GGUF carries tokenizer.ggml.eot_token_id
     for (uint64_t i = 0; i < header->metadata_kv_count; ++i)
     {
         const std::string key = read_string_from_mem(offset);
@@ -386,6 +388,11 @@ void GGUFLoader::parse_and_validate_metadata(size_t& offset)
             const uint32_t v = read_value_from_mem<uint32_t>(offset);
             metadata_.eos_token_id = static_cast<int32_t>(v);
             metadata_.raw_kv.set(key, v);
+        } else if (key == KEY_TOKENIZER_EOT_TOKEN_ID) {
+            if (type != GGUFValueType::UINT32) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_EOT_TOKEN_ID) + " has unexpected type.");
+            const uint32_t v = read_value_from_mem<uint32_t>(offset);
+            eot_token_id = static_cast<int32_t>(v);
+            metadata_.raw_kv.set(key, v);
         } else if (key == KEY_TOKENIZER_BOS_TOKEN_ID) {
             if (type != GGUFValueType::UINT32) throw GGUFLoadError("Metadata key " + std::string(KEY_TOKENIZER_BOS_TOKEN_ID) + " has unexpected type.");
             const uint32_t v = read_value_from_mem<uint32_t>(offset);
@@ -440,6 +447,36 @@ void GGUFLoader::parse_and_validate_metadata(size_t& offset)
                     // Narrower integer types, UINT64, INT64, FLOAT64, ARRAY — skip.
                     skip_gguf_value_from_mem(offset, type);
                     break;
+            }
+        }
+    }
+
+    // Populate stop_token_ids: primary EOS, then explicit EOT from GGUF if
+    // present, then a name-based fallback scan for known end-of-turn tokens
+    // (same strategy llama.cpp uses).  Strings live here in the loader, not
+    // in sampling code.
+    auto add_stop = [this](int32_t id) {
+        if (id >= 0 && std::find(metadata_.stop_token_ids.begin(),
+                                  metadata_.stop_token_ids.end(), id)
+                        == metadata_.stop_token_ids.end())
+            metadata_.stop_token_ids.push_back(id);
+    };
+
+    add_stop(metadata_.eos_token_id);
+
+    if (eot_token_id >= 0) {
+        add_stop(eot_token_id);
+    } else {
+        // Fallback: scan token names for well-known EOT strings.
+        static constexpr std::string_view kEotNames[] = {
+            "<|im_end|>", "<end_of_turn>", "<|eot_id|>",
+        };
+        for (size_t i = 0; i < metadata_.id_to_token.size(); ++i) {
+            for (const auto& name : kEotNames) {
+                if (metadata_.id_to_token[i] == name) {
+                    add_stop(static_cast<int32_t>(i));
+                    break;
+                }
             }
         }
     }

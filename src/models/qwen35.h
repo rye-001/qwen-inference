@@ -141,6 +141,11 @@ public:
         int pos, uint32_t slot_idx,
         ggml_backend_sched_t scheduler) override;
 
+    // TurboQuant active iff the compressed store was allocated (kv_quant_bits>=2).
+    // build_decoding_graph has no TQ path; decode_step uses this to route TQ
+    // decode through the TQ-aware run_prefill (bridge until Option 1 lands).
+    bool tq_active() const override { return tq_store_ != nullptr; }
+
     // Physical layer → cache index mappings
     int32_t get_kv_layer_index(uint32_t physical_layer) const {
         return (physical_layer < kv_layer_map_.size()) ? kv_layer_map_[physical_layer] : -1;

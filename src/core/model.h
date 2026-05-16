@@ -59,6 +59,12 @@ struct ModelMetadata {
     int32_t padding_token_id = -1;   // 151643
     int32_t unknown_token_id = -1;   // tokenizer.ggml.unknown_token_id
     bool add_bos_token = false;
+
+    // All token IDs that signal end-of-generation: primary EOS plus any
+    // end-of-turn token (e.g. <|im_end|> for Qwen, <end_of_turn> for Gemma).
+    // Populated by the loader; callers should iterate this instead of
+    // hard-coding token strings.
+    std::vector<int32_t> stop_token_ids;
     
     std::unordered_map<std::string, TensorMetadata> tensor_inventory;
 

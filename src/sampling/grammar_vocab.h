@@ -40,10 +40,18 @@ public:
     bool is_accepting_state() const;
     void dump_expected() const;
 
+    // Monotonic counter bumped whenever the active stacks change
+    // (accept_token, reset). Sampler::peek_valid_set stamps this on its
+    // cache; Sampler::apply_grammar_constraints asserts the stamp matches
+    // before consuming the cache. A divergence means accept_token was
+    // called between peek and apply — the cache would be stale.
+    uint64_t state_version() const noexcept { return state_version_; }
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     const TokenTrie* trie_ = nullptr;
+    uint64_t state_version_ = 0;
 };
 
 } // namespace qwenium

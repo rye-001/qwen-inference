@@ -1,7 +1,10 @@
+#include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <fstream>
 
 #include "chat.h"
+#include "../core/decode_step.h"
 #include "../models/model_registry.h"
 
 int run_chat(
@@ -40,9 +43,10 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
         if (grammar) {
             sampler->set_grammar(grammar.get());
         }
-        
-        const int32_t eos_token_id = model.get_metadata().eos_token_id;
-        sampler->set_eos_token_id(eos_token_id);
+        sampler->build_token_trie(decoded_vocab);
+
+        for (int32_t id : model.get_metadata().stop_token_ids)
+            sampler->add_eos_token_id(id);
     
         // Load pruned vocabulary if specified
         std::unordered_set<int32_t> pruned_vocab;
@@ -159,18 +163,13 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
             std::vector<int32_t> generated_tokens;
 
             // Decode phase
+            const auto& stop_ids = model.get_metadata().stop_token_ids;
+            using Clock = std::chrono::steady_clock;
+            auto t_decode_start = Clock::now();
+
             for (int i = 0; i < args.max_tokens; ++i) {
-                // We decode the token
                 std::string decoded_token = tokenizer->decode(next_token_id);
-                std::string im_end_str = tmpl.turn_end_suffix();
-
-                // If the turn_end_suffix has a newline, strip it for comparison if the token is just the marker
-                std::string marker_only = im_end_str;
-                if (!marker_only.empty() && marker_only.back() == '\n') {
-                    marker_only.pop_back();
-                }
-
-                if (next_token_id == eos_token_id || decoded_token == im_end_str || decoded_token == marker_only) {
+                if (std::find(stop_ids.begin(), stop_ids.end(), next_token_id) != stop_ids.end()) {
                     break;
                 }
                 log_token(next_token_id);
@@ -184,24 +183,27 @@ for (size_t i = 0; i < raw_vocab.size(); ++i) {
                 // }
 
                 // --- Normal (non-speculative) decode path ---
-                std::vector<int32_t> current_token_vec = { next_token_id };
-                int decode_pos = forward_pass->get_cache_pos(session_slot);
+                next_token_id = decode_step(
+                    forward_pass.get(), scheduler, sampler.get(),
+                    next_token_id, session_slot,
+                    all_tokens, decoded_vocab, vocab_size);
 
-                std::vector<float> token_logits = forward_pass->run_prefill(current_token_vec, decode_pos, session_slot, scheduler);
-                last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
-                
-                next_token_id = sampler->sample(last_token_logits, all_tokens, decoded_vocab);
-
-                if (grammar) {
-                    grammar->accept_token(next_token_id, decoded_vocab);
-                }
-
-                if (next_token_id == eos_token_id) {
+                if (std::find(stop_ids.begin(), stop_ids.end(), next_token_id) != stop_ids.end()) {
                     break;
                 }
 
             }
             end_chat_generation:
+            {
+                auto t_decode_end = Clock::now();
+                auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_decode_end - t_decode_start).count();
+                const size_t n_decoded = generated_tokens.size();
+                double tps = (decode_ms > 0 && n_decoded > 0)
+                    ? (n_decoded * 1000.0 / decode_ms) : 0.0;
+                std::cout << "\n[Timing] decode=" << decode_ms << "ms ("
+                          << n_decoded << " tokens, " << tps << " t/s)\n";
+            }
 
             // After generation ends, append the turn-end marker so the next
             // turn sees a properly terminated assistant message.

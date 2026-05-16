@@ -272,6 +272,11 @@ private:
         return sampler_->sample(last_token_logits, context);
     }
 
+    // TODO: migrate to decode_step (src/core/decode_step.h) once the server
+    // gains per-slot grammar support.  Today this path uses GreedySampler with
+    // no grammar, so the sparse LM head can never fire; migrating now would add
+    // dead code.  The batched nature (n > 1 slots per call) also needs a
+    // batch-aware variant of decode_step that doesn't exist yet.
     std::vector<int> run_batched_decode(const std::vector<int32_t>& tokens,
                                         const std::vector<int>& slot_ids) {
         std::lock_guard<std::mutex> lock(model_mutex_);
