@@ -79,13 +79,32 @@ fn_name ::= "getCustomers"
 # { key: value, ... }  or  {}
 object     ::= "{" sp param_list? sp "}"
 param_list ::= param (sp "," sp param)*
-param      ::= identifier sp ":" sp value
+param      ::= key_name sp ":" sp value
+
+# Object-literal keys — CLOSED set: union of every parameter name across the
+# QUERY/ACTION function signatures in the system prompt. Closing this set
+# moves param keys off the open identifier CHAR_CLASS scan onto the fast
+# LITERAL trie walk (same mechanism as fn_name).
+key_name ::= "tier" | "region" | "status" | "customerId" | "minTotal"
+           | "maxTotal" | "orderId" | "productId" | "category" | "inStock"
+           | "reason" | "note" | "carrier" | "shipmentId" | "trackingNumber"
+           | "amount" | "method" | "paymentId" | "quantity" | "repId"
+
+# Member-access fields — CLOSED set: union of every entity field in ENTITIES
+# plus the array property "length" (array.filter/map/find are method_name).
+field_name ::= "id" | "name" | "tier" | "region" | "status" | "customerId"
+             | "total" | "itemCount" | "createdAt" | "orderId" | "productId"
+             | "sku" | "quantity" | "unitPrice" | "category" | "stock"
+             | "price" | "carrier" | "trackingNumber" | "amount" | "method"
+             | "length"
 
 # Values in params and conditions
 value ::= string | number | member_expr
 
 # identifier.field.field  (also covers bare identifier)
-member_expr ::= identifier ("." identifier)*
+# Base stays the open identifier (variable USE site — Phase 2 territory).
+# The .-suffix parts are CLOSED (entity fields), off the open scan.
+member_expr ::= identifier ("." field_name)*
 
 # Conditions: one or more terms chained with && or ||
 condition ::= cond_term (sp logic_op sp cond_term)*

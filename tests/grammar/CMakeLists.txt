@@ -17,6 +17,10 @@ target_link_libraries(grammar-test-sampling-integration PRIVATE sampling)
 add_executable(grammar-test-resolve-once test_resolve_once.cpp)
 target_link_libraries(grammar-test-resolve-once PRIVATE sampling)
 
+# Phase 1 correctness guard: corpus parse-check (standalone, no model).
+add_executable(grammar-test-corpus-parse test_corpus_parse.cpp)
+target_link_libraries(grammar-test-corpus-parse PRIVATE sampling)
+
 # Diagnostic: byte-identical decode across sparse/dense paths.
 # Heavy — loads a real model. Not a unit test; gated on QWENIUM_MODEL_PATH at runtime.
 add_executable(grammar-test-sparse-differential
