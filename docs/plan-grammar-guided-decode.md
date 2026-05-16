@@ -1,5 +1,42 @@
 # Grammar-Guided Decode: Sparse LM Head + Forced-Token Elision
 
+> **STATUS (2026-05-16): Phase A landed as correctness infrastructure (0% perf
+> on this workload, accepted). Phase B NOT justified — do not start. The real
+> performance win came from outside this plan.**
+>
+> What this investigation actually established:
+>
+> - **Phase A (sparse LM head): landed, byte-identical, fail-loud guards in
+>   place. Measured 0% tok/s** on order-management + Qwen3.6. The plan's
+>   `<3%` pause-gate tripped. Kept as cheap correct infra and a precondition
+>   for any future candidate-narrowing; *not* a perf feature. Inert when TQ is
+>   on (decode routes through the TQ-aware `run_prefill` bridge).
+> - **The bottleneck was never the forward pass.** It is grammar-side
+>   `get_valid_tokens` (~54% of decode). Phase B elides the forward pass and
+>   therefore does **not** address it — Phase B is unjustified on this workload
+>   and is shelved, not scheduled.
+> - **The real win was a grammar fix, not an engine fix:** closing the DSL's
+>   func/field identifier sets to literal alternations (a *grammar-authoring*
+>   change, no engine code) cut grammar cost −66%, +39% tok/s on a
+>   spec-following model. See [Outcomes](#outcomes-2026-05-16).
+> - **Two killed hypotheses (by measurement, before code):** prompt-trie value
+>   slots (value slots were 0.36% of decode), and a per-parse variable-name
+>   symbol table (variable-site scan <1%). Recorded so they are not retried.
+> - **Remaining optimization work** is tracked in
+>   [plan-resolve-once.md → Superseding Work](plan-resolve-once.md#superseding-work-the-real-todo),
+>   not here.
+> - **Two open items that are NOT optimization and need human owners:**
+>   (1) the CHAR_CLASS too-permissive *correctness* bug from the Phase A commit
+>   (still parked as an inline comment); (2) the Q2-vs-9B product decision —
+>   closed-schema grammars convert the weak shipping model's soft failures into
+>   hard no-output. Neither is a prototype task.
+>
+> Everything below is the original plan, retained for context. Phase A's
+> "Done criteria" are annotated with actual results. Phase B is retained as
+> analysis only — **not** a scheduled next step.
+
+---
+
 **Goal:** Exploit grammar-determined token sets to (a) shrink the LM-head matmul when only k tokens are valid, and (b) skip the forward pass entirely when only one token is valid.
 **Impact (rough, on Qwen 3.6-A3B with a constrained DSL):**
 - Sparse LM head alone: ~5–10% more tok/s.
@@ -56,24 +93,33 @@ W_k     = ggml_get_rows(ctx_, output_weight, valid_idx); // [k, hidden]
 logits_k = ggml_mul_mat(ctx_, W_k, cur);                 // [k]
 ```
 
-`valid_idx` is a `[k]` int32 input tensor populated host-side before `ggml_graph_compute`.
+`valid_idx` is a `[k]` int32 input tensor populated host-side before `ggml_graph_compute`. Its size changes per step — that's the dynamic-shape wrinkle ggml dislikes inside a single persistent graph.
 
-**Why two graphs, not one.** ggml dislikes dynamic shapes inside a graph. Cleanest: build a dense graph and a sparse graph at init; the decode loop picks per step based on `|valid_set|` (e.g. `k < vocab/8`). Above the threshold, dense wins; below, sparse wins. Pattern already exists — see [src/models/qwen3.cpp:595](../src/models/qwen3.cpp:595) (`_build_output_head_graph`).
+**Build per step, with a branch in the head builder.** The decode pipeline already does `reset_context()` and rebuilds the decode graph on every step, so we don't need (and can't easily have) two persistent graphs co-resident in one context. Two pre-built graphs in two separate contexts is structurally heavier (doubled scratch buffers, doubled scheduler bindings) and buys nothing here, because no other part of the engine wants a persistent decode graph. A `k_max`-padded static graph wastes memory on every step and hides the conditional inside the graph — the kind of cleverness CLAUDE.md tells us to refuse.
+
+The clean shape:
+
+- The **decode loop** computes `valid_indices` if the grammar narrows below threshold (e.g. `k < vocab/8`); passes `nullptr` otherwise. Policy lives here, in one place.
+- `build_output_head(gf, cur, valid_indices)` takes the optional tensor. **Mechanism** lives here: if non-null, build the sparse path (`get_rows` then `mul_mat`); if null, build today's dense path.
+- One context, one graph at a time, one builder function. No two-graph problem.
+
+The per-step `ggml_backend_sched_alloc_graph` cost is real but small — O(graph walk), single-digit ms at most, against ~50 ms per Qwen 3.6-A3B decode token. Noise.
+
+**Future escape hatch.** If the ANE plan ([plan-ane-lm-head.md](plan-ane-lm-head.md)) ever lands and wants pipelining-friendly persistent graphs, we promote to a two-context design *then*, driven by ANE's actual needs. Not speculatively now.
 
 **Why this matters more on MoE.** On dense Qwen3-32B the LM head is ~1% of forward — barely worth touching. On Qwen3.6-A3B only ~3B of 35B params activate per token, so the body shrinks ~10× and the LM head climbs to ~10–15% of forward. The headline target model is exactly where this earns its keep.
 
 ### Files touched (Phase A)
 
 Core math:
-- [src/models/forward_pass_base.cpp:100](../src/models/forward_pass_base.cpp:100) — add `build_output_head_sparse(gf, cur, valid_idx_input)`.
-- [src/models/forward_pass_base.h:161](../src/models/forward_pass_base.h:161) — declare it + hold the `valid_indices` input tensor handle.
+- [src/models/forward_pass_base.cpp:100](../src/models/forward_pass_base.cpp:100) — extend `build_output_head(gf, cur)` to `build_output_head(gf, cur, ggml_tensor* valid_indices = nullptr)`. Internally: if `valid_indices != nullptr`, `W_k = ggml_get_rows(...)` then `mul_mat`; else today's dense path.
+- [src/models/forward_pass_base.h:161](../src/models/forward_pass_base.h:161) — update the declaration; no new graph-handle state since the graph is rebuilt per step.
 
-Recipe call sites (per opt-in model):
-- [src/models/qwen36.cpp:311](../src/models/qwen36.cpp:311), [:436](../src/models/qwen36.cpp:436) — primary target (MoE, biggest payoff).
-- [src/models/qwen3.cpp:182](../src/models/qwen3.cpp:182), [src/models/qwen35.cpp:265](../src/models/qwen35.cpp:265), [:779](../src/models/qwen35.cpp:779) — secondary.
-- Gemma recipes only if needed.
-
-Each opt-in recipe builds two output-head graphs and exposes a selector.
+Recipe call sites (no per-recipe change required):
+- All recipes that call `build_output_head(gf, inpL)` keep working unchanged because `valid_indices` defaults to `nullptr` (dense path).
+- The opt-in surface is at the **decode loop**, not the recipe — see below.
+- [src/models/qwen36.cpp:311](../src/models/qwen36.cpp:311), [:436](../src/models/qwen36.cpp:436) — primary target for benchmarking (MoE, biggest payoff), but no edit needed.
+- [src/models/qwen3.cpp:182](../src/models/qwen3.cpp:182), [src/models/qwen35.cpp:265](../src/models/qwen35.cpp:265), [:779](../src/models/qwen35.cpp:779) — secondary, also no edit needed.
 
 Sampling (produce `valid_indices` *before* the forward pass):
 - [src/sampling/token-trie.h](../src/sampling/token-trie.h) / [.cpp](../src/sampling/token-trie.cpp) — add `current_valid_token_ids(slot) -> std::vector<int32_t>`. The trie's bitset already has this; just an enumeration helper.
@@ -90,16 +136,30 @@ All three currently do the same three-step dance (run_prefill → tail logits �
 
 **Note.** The three-way duplication in the decode loop is pre-existing — this plan surfaces it, doesn't cause it. Worth fixing while wiring this through.
 
-### Done criteria (Phase A)
+### Done criteria (Phase A) — *actual results annotated*
 
-1. Recipe builds two graphs at init; selector picks based on `|valid_set|` and threshold.
-2. Bit-for-bit identical sampling for a grammar-free workload (sparse path never taken).
-3. End-to-end tok/s on Qwen 3.6-A3B with the order-mgmt prompt: target +5–10%.
-4. No new graph node on the dense path. No `valid_indices` input plumbed through layers.
+1. ✅ `build_output_head` accepts optional `valid_indices`; sparse path activates when non-null.
+2. ✅ Decode loop selects sparse vs dense per step; policy in `decode_step` (one place).
+3. ✅ Bit-for-bit identical sampling — verified via `tests/grammar/test_sparse_differential.cpp`.
+4. ❌ **Not met: measured 0%, not +5–10%.** Forward pass was not the bottleneck on this workload; `get_valid_tokens` (grammar) dominates. Accepted: Phase A is correctness infra, not a perf feature.
+5. ✅ No new graph node on the dense path; no `valid_indices` through layer modules.
+
+> Also surfaced and fixed during Phase A: an uninitialized-sparse-indices
+> ordering bug (caught by the differential test). Still **open** from Phase A:
+> the CHAR_CLASS too-permissive *correctness* bug — needs a human owner, not
+> a perf pass.
 
 ---
 
 ## Phase B — Forced-token elision (the main event)
+
+> **NOT SCHEDULED (2026-05-16).** Phase B elides the forward pass; the measured
+> bottleneck is grammar-side `get_valid_tokens`, which Phase B does not touch.
+> Its economics were derived assuming forward dominated — false on this
+> workload. Retained below as analysis only. Revisit only if a future workload
+> demonstrates forward-pass dominance *and* the grammar cost
+> ([plan-resolve-once.md](plan-resolve-once.md#superseding-work-the-real-todo))
+> is already addressed.
 
 **The mechanism.** When the TokenTrie state has exactly one valid token, the next token is determined. We:
 1. Emit that token to the output stream.
@@ -145,12 +205,56 @@ This phase is genuinely architectural — it's the stress test for whether the s
 
 ## Order of operations
 
-1. **Phase A first.** Lower risk, smaller surface, proves the grammar→recipe wiring.
-2. **Lift the decode-loop duplication** into a `src/core/` helper while doing Phase A — three callers, three identical edits, obvious refactor.
-3. **Phase B second**, only after Phase A is landed and the wiring is verified.
-4. Re-measure on Qwen 3.6-A3B with the order-mgmt prompt at each phase boundary.
+> **What actually happened (2026-05-16):** Phase A landed (steps 1–2 done,
+> incl. the `src/core/decode_step` lift). The `<3%` gate at step 4 tripped
+> (measured 0%). Per this section's own instruction, we paused and rethought
+> the seam instead of starting Phase B — that investigation found the
+> bottleneck is grammar-side, not forward-side, and the leverage was a grammar
+> rewrite. Phase B (step 3) was correctly **not** started. Remaining work
+> moved to [plan-resolve-once.md](plan-resolve-once.md#superseding-work-the-real-todo).
 
-If Phase A's wins land below 3% or the wiring proves ugly, that's a strong signal to pause and rethink the seam before committing to Phase B.
+1. ✅ **Phase A first.** Done. Wiring proven; perf gate failed (accepted).
+2. ✅ **Lift the decode-loop duplication** into `src/core/decode_step`. Done.
+3. ⛔ **Phase B second** — NOT started. Gate at step 4 tripped; bottleneck is
+   not the forward pass. Shelved as analysis.
+4. ✅ Re-measured at the boundary. Result: 0% → pause-gate honored.
+
+The pause-gate below did its job: Phase A's win landed at 0%, we paused and
+rethought the seam rather than committing to Phase B. That is the intended
+behavior, working as designed.
+
+---
+
+## Outcomes (2026-05-16)
+
+Final accounting for this investigation.
+
+| Hypothesis | Verdict | Evidence |
+|---|---|---|
+| Phase A sparse LM head | **Landed, 0% perf** — correctness infra only | Differential test byte-identical; tok/s flat (forward not the bottleneck) |
+| Phase B forced-token elision | **Not started** | Bottleneck is grammar-side; Phase B elides forward |
+| Prompt-trie value slots | **Killed by measurement** | Value slots = 0.36% of decode |
+| Per-parse variable symbol table | **Killed by measurement** | Variable-site identifier scan <1% of grammar cost |
+| **Close func/field identifier sets in GBNF** | **✅ The real win** | −66% grammar cost, +39% tok/s (spec-following model); grammar-only, no engine code |
+
+**Where the cost actually is:** ~54% of decode is `get_valid_tokens`. Residual
+after schema-close splits into cross-call recompute (50–75%, the resolve-once
+*cache* — distinct from the already-implemented per-call pre-resolve) and
+per-call vocab-sized bitmask churn (~20–40%). Both tracked in
+[plan-resolve-once.md → Superseding Work](plan-resolve-once.md#superseding-work-the-real-todo).
+
+**Open, needs a human owner (not optimization):**
+1. CHAR_CLASS too-permissive **correctness** bug from the Phase A commit — still
+   parked as an inline comment in `grammar_vocab.cpp`.
+2. **Q2-vs-9B product decision** — closing the schema set converts the weak
+   shipping model's soft failures (slightly-wrong code) into hard failures
+   (forced-EOS, no output). Product call, separate owner.
+
+**Method note.** Five hypotheses, each decided by one measurement before
+committing code. The two that would have been the most engineering work
+(prompt-trie, symbol table) were both killed by a one-afternoon profile. The
+recurring failure mode throughout: trusting an *aggregated* cost bucket. Every
+correct decision came from splitting the bucket at the right granularity first.
 
 ---
 
