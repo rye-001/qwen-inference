@@ -36,9 +36,14 @@ void ForwardPassBase::reset_context() {
     struct ggml_init_params params = {
         .mem_size   = ctx_buffer_.size(),
         .mem_buffer = ctx_buffer_.data(),
-        .no_alloc   = true, 
+        .no_alloc   = true,
     };
     ctx_ = ggml_init(params);
+    valid_indices_input_ = nullptr; // old context is gone; handle is dangling
+    // NOTE: do NOT clear sparse_decode_ids_ here. reset_context is called
+    // inside build_decoding_graph (between the caller's set_sparse_decode_ids
+    // and build_output_head's read), so clearing would erase the indices the
+    // caller just armed. Consume-on-use happens in upload_sparse_indices.
 }
 
 ggml_cgraph* ForwardPassBase::new_graph() {
@@ -97,17 +102,44 @@ ggml_tensor* ForwardPassBase::build_attn_mha(
     return ::build_attn_mha(ctx_, gf, q, k, v, kq_mask, sinks, kq_scale, pos, il);
 }
 
-void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur) {
+void ForwardPassBase::build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx) {
+    // Auto-create sparse tensor from host-side ids if caller didn't supply one.
+    // Do NOT clear sparse_decode_ids_ here — upload_sparse_indices runs after
+    // sched_alloc_graph and reads the host vector to populate GPU memory.
+    // Clearing here turned upload into a silent no-op (uninitialized indices).
+    if (valid_idx == nullptr && !sparse_decode_ids_.empty()) {
+        valid_idx = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32,
+                                       static_cast<int64_t>(sparse_decode_ids_.size()));
+        ggml_set_input(valid_idx);
+        ggml_set_name(valid_idx, "valid_indices");
+        ggml_build_forward_expand(gf, valid_idx);
+        valid_indices_input_ = valid_idx;
+    }
+
     cur = build_norm(gf, cur, model_.get_output_norm_weight(), -1);
     set_tensor_name(gf, cur, "final_norm");
 
-    if (model_.get_output_weight() != nullptr) {
-        cur = ggml_mul_mat(ctx_, model_.get_output_weight(), cur);
-    } else {
-        cur = ggml_mul_mat(ctx_, model_.get_token_embedding_weight(), cur);
+    ggml_tensor* weight = model_.get_output_weight()
+        ? model_.get_output_weight()
+        : model_.get_token_embedding_weight();
+
+    if (valid_idx) {
+        weight = ggml_get_rows(ctx_, weight, valid_idx);
+        ggml_set_name(weight, "output_weight_k");
     }
+    cur = ggml_mul_mat(ctx_, weight, cur);
     ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
+}
+
+void ForwardPassBase::upload_sparse_indices() {
+    if (!valid_indices_input_ || sparse_decode_ids_.empty()) return;
+    ggml_backend_tensor_set(valid_indices_input_,
+                            sparse_decode_ids_.data(), 0,
+                            sparse_decode_ids_.size() * sizeof(int32_t));
+    // Consume-on-use: clear after upload so a forgotten re-arm on the next
+    // step falls back to dense rather than replaying stale indices.
+    sparse_decode_ids_.clear();
 }
 
 void ForwardPassBase::set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il) const {

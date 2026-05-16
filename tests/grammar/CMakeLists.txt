@@ -16,3 +16,23 @@ target_link_libraries(grammar-test-sampling-integration PRIVATE sampling)
 
 add_executable(grammar-test-resolve-once test_resolve_once.cpp)
 target_link_libraries(grammar-test-resolve-once PRIVATE sampling)
+
+# Diagnostic: byte-identical decode across sparse/dense paths.
+# Heavy — loads a real model. Not a unit test; gated on QWENIUM_MODEL_PATH at runtime.
+add_executable(grammar-test-sparse-differential
+    test_sparse_differential.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/decode_step.cpp
+)
+target_link_libraries(grammar-test-sparse-differential PRIVATE
+    qinf-models
+    core
+    sampling
+    ggml
+    Threads::Threads
+)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(grammar-test-sparse-differential PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if(APPLE)
+    target_link_libraries(grammar-test-sparse-differential PRIVATE "-framework Accelerate")
+endif()

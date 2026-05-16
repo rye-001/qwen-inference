@@ -559,6 +559,7 @@ void GrammarVocab::reset() {
     impl_->stacks.clear();
     const uint32_t root_id = impl_->symbol_ids.at("root");
     Impl::explore_alternatives(impl_.get(), impl_->rules[root_id].data(), {}, impl_->stacks);
+    ++state_version_;
 }
 
 bool GrammarVocab::is_accepting_state() const {
@@ -592,6 +593,15 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
                 if (cc_seen.count(cc_id)) continue;
                 cc_seen[cc_id] = true;
 
+                // KNOWN BUG (pre-existing): mark_char_class is single-char
+                // only and may mark multi-char tokens whose later chars exit
+                // the class without matching what follows. This makes
+                // get_valid_tokens too permissive at standalone CHAR_CLASS
+                // states (e.g. after `await ` the token ` (` is marked valid
+                // because its first char is in sp). A correct fix requires
+                // per-candidate consume_token validation; an earlier attempt
+                // landed correctness but regressed decode tok/s by ~10x.
+                // Left for a separate change with proper perf workout.
                 const auto& cc = impl_->char_classes[cc_id];
                 trie_->mark_char_class(cc.first, cc.second, valid_mask);
             }
@@ -613,6 +623,10 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
             // States share (lit_id, char_idx) but may differ in continuations.
             struct PreResolved {
                 std::vector<Impl::GrammarState> after_terminals;
+                // Per-terminal flag: true iff terminal is a CHAR_CLASS that loops
+                // back to itself via STAR/PLUS. When set, a token whose overshoot
+                // stays entirely inside the class is valid without consume_token.
+                std::vector<bool> is_star_loop;
                 bool has_root_end = false;
             };
             std::vector<PreResolved> pre_resolved(states.size());
@@ -621,6 +635,23 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
                                              states[si]->pos, states[si]->continuations,
                                              pre_resolved[si].after_terminals,
                                              pre_resolved[si].has_root_end);
+
+                auto& terms = pre_resolved[si].after_terminals;
+                pre_resolved[si].is_star_loop.assign(terms.size(), false);
+                for (size_t ti = 0; ti < terms.size(); ti++) {
+                    if (terms[ti].pos->type != Elem::CHAR_CLASS) continue;
+                    std::vector<Impl::GrammarState> after;
+                    bool dummy = false;
+                    Impl::resolve_after_terminal(impl_.get(),
+                                                 terms[ti].pos, terms[ti].continuations,
+                                                 after, dummy);
+                    for (const auto& a : after) {
+                        if (a.pos == terms[ti].pos) {
+                            pre_resolved[si].is_star_loop[ti] = true;
+                            break;
+                        }
+                    }
+                }
             }
 
             for (int32_t tok_id : candidates) {
@@ -654,7 +685,9 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
                     const size_t overshoot_len = tok_len - tok_offset;
                     const char overshoot_char = tok[tok_offset];
                     for (size_t si = 0; si < states.size() && !valid_mask[tok_id]; si++) {
-                        for (const auto& resolved : pre_resolved[si].after_terminals) {
+                        const auto& terms = pre_resolved[si].after_terminals;
+                        for (size_t ti = 0; ti < terms.size(); ti++) {
+                            const auto& resolved = terms[ti];
                             if (resolved.pos->type == Elem::LITERAL) {
                                 const std::string& rlit = impl_->literal_values[resolved.pos->value];
                                 const size_t rlit_remaining = rlit.size() - resolved.char_idx;
@@ -689,9 +722,25 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
                                 const bool in_set  = cc.first.count(overshoot_char) > 0;
                                 const bool allowed = cc.second ? !in_set : in_set;
                                 if (!allowed) continue;
-                                // CHAR_CLASS matches 1 char. If overshoot_len == 1,
-                                // the token is consumed. Valid iff grammar can advance.
-                                // Fall through to consume_token.
+
+                                // Fast path: CHAR_CLASS in STAR/PLUS loop. If every
+                                // overshoot char stays inside the class, the token is
+                                // a valid partial match (grammar stays in the loop).
+                                // Only fall through to consume_token for tokens whose
+                                // overshoot exits the class mid-token.
+                                if (pre_resolved[si].is_star_loop[ti]) {
+                                    bool all_in = true;
+                                    for (size_t k = tok_offset + 1; k < tok_len; ++k) {
+                                        const bool ki = cc.first.count(tok[k]) > 0;
+                                        const bool ok = cc.second ? !ki : ki;
+                                        if (!ok) { all_in = false; break; }
+                                    }
+                                    if (all_in) {
+                                        valid_mask[tok_id] = true;
+                                        break;
+                                    }
+                                }
+                                // Else (or mid-token exit): fall through to consume_token.
                             } else {
                                 continue; // END state — can't consume more chars
                             }
@@ -757,7 +806,6 @@ std::vector<int32_t> GrammarVocab::get_valid_tokens(const std::vector<std::strin
 void GrammarVocab::accept_token(int32_t token_id, const std::vector<std::string>& vocab) {
     if (!impl_) return;
     if (token_id < 0 || static_cast<size_t>(token_id) >= vocab.size()) return;
-
     const std::string& token_str = vocab[token_id];
     std::vector<Impl::GrammarState> new_stacks;
 
@@ -769,6 +817,7 @@ void GrammarVocab::accept_token(int32_t token_id, const std::vector<std::string>
     }
 
     impl_->stacks = std::move(new_stacks);
+    ++state_version_;
 }
 
 void GrammarVocab::dump_expected() const {

@@ -93,6 +93,11 @@ public:
     // ── TurboQuant ──────────────────────────────────────────────
     CompressedKVStore* get_tq_store() { return tq_store_.get(); }
 
+    // TurboQuant active iff the compressed store was allocated (kv_quant_bits>=2).
+    // build_decoding_graph has no TQ path; decode_step uses this to route TQ
+    // decode through the TQ-aware run_prefill (bridge until Option 1 lands).
+    bool tq_active() const override { return tq_store_ != nullptr; }
+
     std::vector<float> run_prefill(
         const std::vector<int32_t>& tokens,
         int pos, uint32_t slot_idx,

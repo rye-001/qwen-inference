@@ -778,6 +778,12 @@ ggml_cgraph* Gemma4ForwardPass::build_decoding_graph(
     const std::vector<uint32_t>& /*slots*/,
     const std::vector<int32_t>& /*positions*/)
 {
+    // TODO(sparse): when single-token decode lands here, build the LM head
+    // via build_output_head(gf, inpL) — NOT a hand-rolled ggml_mul_mat like
+    // build_prefill_graph does. decode_step arms sparse_decode_ids_ for
+    // grammar-constrained decode; a hand-rolled head ignores them and returns
+    // full-vocab logits, causing sample_sparse size-mismatch / bad-access
+    // (the class of bug fixed in qwen3.cpp / qwen35.cpp).
     throw std::runtime_error(
         "Gemma4ForwardPass::build_decoding_graph: batched decode not "
         "implemented in PR G4.8 (architecture='gemma4'); expected: "

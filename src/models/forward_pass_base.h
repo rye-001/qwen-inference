@@ -47,6 +47,14 @@ public:
         const std::vector<uint32_t>& slots,
         const std::vector<int32_t>& positions) = 0;
 
+    // True when TurboQuant KV compression is active for this forward pass.
+    // BRIDGE (Option 1 pending): build_decoding_graph has no TurboQuant
+    // support — under TQ the full kv_cache_ is intentionally null. decode_step
+    // queries this to refuse the TQ-unaware decode graph and route to the
+    // legacy per-recipe single-token run_prefill path (which IS TQ-aware).
+    // Default false; recipes that allocate a compressed store override it.
+    virtual bool tq_active() const { return false; }
+
     // ── TurboQuant per-layer compute ────────────────────────────
     // Encapsulates the full prefill pipeline: build → alloc → set → compute → advance.
     // When TQ is enabled, processes one layer at a time with compressed KV.
@@ -119,6 +127,11 @@ protected:
     struct ggml_context* ctx_;
     std::vector<uint8_t> ctx_buffer_;
 
+    // Sparse decode: host-side indices set before graph build; ggml handle
+    // valid between build_output_head and the next reset_context call.
+    std::vector<int32_t> sparse_decode_ids_;
+    ggml_tensor*         valid_indices_input_ = nullptr;
+
     // SnapKV: post-prefill KV eviction (0 = disabled)
     uint32_t snapkv_budget_ = 0;
     uint32_t snapkv_window_ = 32;
@@ -158,7 +171,26 @@ protected:
         int il) const;
 
     // Build the output head: final norm → LM head matmul → "logits" tensor
-    void build_output_head(ggml_cgraph* gf, ggml_tensor* cur);
+    // valid_idx: [k] int32 input tensor selecting which vocab rows to compute;
+    // nullptr = dense (full vocab). Use when the caller knows the candidate set
+    // ahead of the forward pass and wants to avoid materializing the full vocab matmul.
+    // If valid_idx is nullptr and sparse_decode_ids_ is non-empty, the tensor is
+    // created automatically from sparse_decode_ids_ (set by set_sparse_decode_ids).
+    void build_output_head(ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* valid_idx = nullptr);
 
     void set_tensor_name(ggml_cgraph* gf, ggml_tensor* tensor, const char* name, int il = -1) const;
+
+public:
+    // ── Sparse decode support ────────────────────────────────────────────────
+    // Set the host-side valid token indices for the next decode step.
+    // Pass an empty vector to use the dense path (default).
+    // Must be called before build_decoding_graph.
+    void set_sparse_decode_ids(std::vector<int32_t> ids) {
+        sparse_decode_ids_ = std::move(ids);
+    }
+
+    // Copy sparse_decode_ids_ into the ggml input tensor created during
+    // build_output_head. Call after ggml_backend_sched_alloc_graph and
+    // before ggml_backend_sched_graph_compute.
+    void upload_sparse_indices();
 };

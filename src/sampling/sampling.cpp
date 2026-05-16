@@ -17,7 +17,40 @@ void Sampler::apply_vocab_pruning(std::vector<float>& logits) {
     }
 }
 
+std::vector<int32_t> Sampler::peek_valid_set() {
+    if (!grammar_ || vocab_.empty()) {
+        cached_valid_ids_valid_ = false;
+        return {};
+    }
+
+    std::vector<int32_t> valid = grammar_->get_valid_tokens(vocab_);
+
+    // If the grammar is in an accepting state, ensure all registered stop
+    // tokens are included in the valid set.
+    if (grammar_->is_accepting_state()) {
+        for (int32_t id : eos_token_ids_)
+            valid.push_back(id);
+    }
+
+    if (pruned_vocab_) {
+        valid.erase(
+            std::remove_if(valid.begin(), valid.end(),
+                [this](int32_t id) { return pruned_vocab_->count(id) == 0; }),
+            valid.end());
+    }
+
+    // Cache the result so apply_grammar_constraints can consume it on the
+    // dense path without calling get_valid_tokens a second time. Stamp the
+    // grammar's state_version so apply can fail loud on a stale read.
+    cached_valid_ids_         = valid;
+    cached_valid_ids_valid_   = true;
+    cached_valid_ids_version_ = grammar_->state_version();
+
+    return valid;
+}
+
 void Sampler::build_token_trie(const std::vector<std::string>& vocab) {
+    vocab_ = vocab;
     token_trie_ = std::make_unique<TokenTrie>();
     token_trie_->build(vocab);
 }
@@ -35,7 +68,26 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::v
         grammar_->set_token_trie(token_trie_.get());
     }
 
-    std::vector<int32_t> valid_tokens = grammar_->get_valid_tokens(token_strs);
+    // Use the result cached by peek_valid_set() when available — avoids a
+    // redundant get_valid_tokens call on the dense decode path. The cache
+    // is stamped with the grammar's state_version at write time; assert it
+    // still matches before consuming, else the cache is stale (caller ran
+    // accept_token between peek and apply).
+    std::vector<int32_t> valid_tokens;
+    if (cached_valid_ids_valid_) {
+        const uint64_t current_version = grammar_->state_version();
+        if (current_version != cached_valid_ids_version_) {
+            throw std::runtime_error(
+                "Sampler::apply_grammar_constraints: stale cached_valid_ids_; "
+                "expected: grammar->state_version() == cached_valid_ids_version_ ("
+                + std::to_string(cached_valid_ids_version_) + "), "
+                "actual: " + std::to_string(current_version));
+        }
+        valid_tokens            = std::move(cached_valid_ids_);
+        cached_valid_ids_valid_ = false;
+    } else {
+        valid_tokens = grammar_->get_valid_tokens(token_strs);
+    }
 
     if (valid_tokens.empty()) {
         std::cerr << "[GrammarVocab] ERROR: Grammar is stuck! No valid tokens found in vocabulary.\n";
@@ -50,11 +102,9 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::v
 
         for (size_t i = 0; i < logits.size(); ++i)
             logits[i] = -std::numeric_limits<float>::infinity();
-        for (size_t i = 0; i < token_strs.size(); ++i) {
-            if (token_strs[i] == "<|endoftext|>" || token_strs[i] == "<|im_end|>") {
-                logits[i] = 0.0f;
-                break;
-            }
+        for (int32_t id : eos_token_ids_) {
+            if (id >= 0 && static_cast<size_t>(id) < logits.size())
+                logits[id] = 0.0f;
         }
         return;
     }
@@ -64,14 +114,10 @@ void Sampler::apply_grammar_constraints(std::vector<float>& logits, const std::v
     for (int32_t id : valid_tokens) valid_mask[id] = true;
 
     if (grammar_->is_accepting_state()) {
-        for (size_t i = 0; i < token_strs.size(); ++i) {
-            if (token_strs[i] == "<|endoftext|>" || token_strs[i] == "<|im_end|>") {
-                valid_mask[i] = true;
-                break;
-            }
+        for (int32_t id : eos_token_ids_) {
+            if (static_cast<size_t>(id) < vocab_size)
+                valid_mask[id] = true;
         }
-        if (eos_token_id_ >= 0 && static_cast<size_t>(eos_token_id_) < vocab_size)
-            valid_mask[eos_token_id_] = true;
     }
 
     for (size_t i = 0; i < vocab_size; ++i) {
@@ -95,6 +141,21 @@ void GreedySampler::apply_repetition_penalty(std::vector<float>& logits,
     }
 }
 
+void Sampler::apply_repetition_penalty_sparse(std::vector<float>& sparse_logits,
+                                               const std::vector<int32_t>& valid_ids,
+                                               const std::vector<int32_t>& last_tokens,
+                                               float penalty, int lookback) {
+    if (penalty == 1.0f || last_tokens.empty()) return;
+    const size_t window = std::min(static_cast<size_t>(lookback), last_tokens.size());
+    std::unordered_set<int32_t> recent(last_tokens.end() - window, last_tokens.end());
+    for (size_t j = 0; j < valid_ids.size(); ++j) {
+        if (recent.count(valid_ids[j])) {
+            sparse_logits[j] = sparse_logits[j] < 0 ? sparse_logits[j] * penalty
+                                                     : sparse_logits[j] / penalty;
+        }
+    }
+}
+
 int GreedySampler::sample(std::vector<float>& logits,
                           const std::vector<int32_t>& last_tokens,
                           const std::vector<std::string>& token_strs) {
@@ -105,6 +166,31 @@ int GreedySampler::sample(std::vector<float>& logits,
     apply_repetition_penalty(logits, last_tokens);
     auto max_it = std::max_element(logits.begin(), logits.end());
     return static_cast<int>(std::distance(logits.begin(), max_it));
+}
+
+int32_t GreedySampler::sample_sparse(std::vector<float>& sparse_logits,
+                                      const std::vector<int32_t>& valid_ids,
+                                      const std::vector<int32_t>& last_tokens) {
+    if (sparse_logits.empty())
+        throw std::runtime_error("sample_sparse: empty logits; expected: non-empty, actual: 0");
+    if (sparse_logits.size() != valid_ids.size())
+        throw std::runtime_error("sample_sparse: sparse_logits.size() != valid_ids.size(); expected: equal, actual: "
+                                 + std::to_string(sparse_logits.size()) + " vs "
+                                 + std::to_string(valid_ids.size()));
+    Sampler::apply_repetition_penalty_sparse(sparse_logits, valid_ids, last_tokens,
+                                              repetition_penalty_, repetition_lookback_);
+    const size_t j = static_cast<size_t>(
+        std::distance(sparse_logits.begin(),
+                      std::max_element(sparse_logits.begin(), sparse_logits.end())));
+    if (j >= valid_ids.size())
+        throw std::runtime_error("sample_sparse: argmax index out of range; expected: < "
+                                 + std::to_string(valid_ids.size()) + ", actual: "
+                                 + std::to_string(j));
+    const int32_t id = valid_ids[j];
+    if (id < 0)
+        throw std::runtime_error("sample_sparse: returned id from valid_ids is negative; expected: >= 0, actual: "
+                                 + std::to_string(id));
+    return id;
 }
 
 // ---- TemperatureSampler ----
@@ -191,6 +277,81 @@ int TemperatureSampler::sample(std::vector<float>& logits,
 
     std::discrete_distribution<> dist(probs.begin(), probs.end());
     return sorted[dist(gen_)].first;
+}
+
+int32_t TemperatureSampler::sample_sparse(std::vector<float>& sparse_logits,
+                                           const std::vector<int32_t>& valid_ids,
+                                           const std::vector<int32_t>& last_tokens) {
+    if (sparse_logits.empty())
+        throw std::runtime_error("sample_sparse: empty logits; expected: non-empty, actual: 0");
+    if (sparse_logits.size() != valid_ids.size())
+        throw std::runtime_error("sample_sparse: sparse_logits.size() != valid_ids.size(); expected: equal, actual: "
+                                 + std::to_string(sparse_logits.size()) + " vs "
+                                 + std::to_string(valid_ids.size()));
+
+    Sampler::apply_repetition_penalty_sparse(sparse_logits, valid_ids, last_tokens,
+                                              repetition_penalty_, repetition_lookback_);
+
+    auto check_id = [&](size_t j) -> int32_t {
+        if (j >= valid_ids.size())
+            throw std::runtime_error("sample_sparse: argmax index out of range; expected: < "
+                                     + std::to_string(valid_ids.size()) + ", actual: "
+                                     + std::to_string(j));
+        const int32_t id = valid_ids[j];
+        if (id < 0)
+            throw std::runtime_error("sample_sparse: returned id from valid_ids is negative; expected: >= 0, actual: "
+                                     + std::to_string(id));
+        return id;
+    };
+
+    if (temperature_ <= 0.0f) {
+        const size_t j = static_cast<size_t>(
+            std::distance(sparse_logits.begin(),
+                          std::max_element(sparse_logits.begin(), sparse_logits.end())));
+        return check_id(j);
+    }
+
+    const size_t k = sparse_logits.size();
+    for (size_t j = 0; j < k; ++j)
+        sparse_logits[j] /= temperature_;
+
+    // sorted holds (position j in sparse_logits, logit value)
+    std::vector<std::pair<size_t, float>> sorted;
+    sorted.reserve(k);
+    for (size_t j = 0; j < k; ++j)
+        sorted.emplace_back(j, sparse_logits[j]);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    if (top_k_ > 0 && static_cast<size_t>(top_k_) < sorted.size())
+        sorted.resize(static_cast<size_t>(top_k_));
+
+    if (top_p_ > 0.0f && top_p_ < 1.0f) {
+        const float max_l = sorted[0].second;
+        float sum_exp = 0.0f;
+        for (const auto& p : sorted) sum_exp += expf(p.second - max_l);
+        float cum = 0.0f;
+        size_t cutoff = sorted.size();
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            cum += expf(sorted[i].second - max_l) / sum_exp;
+            if (cum >= top_p_) { cutoff = i + 1; break; }
+        }
+        sorted.resize(cutoff);
+    }
+
+    const float max_l = sorted[0].second;
+    float sum_exp = 0.0f;
+    std::vector<float> probs;
+    probs.reserve(sorted.size());
+    for (const auto& p : sorted) {
+        float e = expf(p.second - max_l);
+        probs.push_back(e);
+        sum_exp += e;
+    }
+    for (float& p : probs) p /= sum_exp;
+
+    std::discrete_distribution<> dist(probs.begin(), probs.end());
+    return check_id(sorted[static_cast<size_t>(dist(gen_))].first);
 }
 
 } // namespace qwenium

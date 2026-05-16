@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "complete.h"
+#include "../core/decode_step.h"
 #include "../models/model_registry.h"
 
 int run_complete(
@@ -51,6 +52,10 @@ int run_complete(
         if (grammar) {
             sampler->set_grammar(grammar.get());
         }
+        sampler->build_token_trie(vocab);
+
+        for (int32_t id : model.get_metadata().stop_token_ids)
+            sampler->add_eos_token_id(id);
 
         // Load pruned vocabulary if specified
         std::unordered_set<int32_t> pruned_vocab;
@@ -179,16 +184,10 @@ int run_complete(
             }
 
             // --- Normal decode path ---
-            std::vector<int32_t> current_token_vec = { next_token_id };
-            int current_pos = forward_pass->get_cache_pos(0); // Slot 0
-
-            std::vector<float> token_logits = forward_pass->run_prefill(current_token_vec, current_pos, 0, scheduler);
-            last_token_logits.assign(token_logits.begin(), token_logits.begin() + vocab_size);
-            
-            next_token_id = sampler->sample(last_token_logits, tokens, vocab);
-            if (grammar) {
-                grammar->accept_token(next_token_id, vocab);
-            }
+            next_token_id = decode_step(
+                forward_pass.get(), scheduler, sampler.get(),
+                next_token_id, 0,
+                tokens, vocab, vocab_size);
         }
         end_single_generation:
         auto t_decode_end = Clock::now();
